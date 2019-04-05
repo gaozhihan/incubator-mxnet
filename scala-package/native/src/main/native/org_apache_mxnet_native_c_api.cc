@@ -33,6 +33,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "jni_helper_func.h"
 
 JavaVM *_jvm;
@@ -403,14 +404,15 @@ JNIEXPORT jint JNICALL Java_org_apache_mxnet_LibInfo_mxNDArrayAt
   return ret;
 }
 
-JNIEXPORT jint JNICALL Java_org_apache_mxnet_LibInfo_mxNDArrayReshape
-  (JNIEnv *env, jobject obj, jlong ndArrayPtr, jint ndim, jintArray dims, jobject reshapedHandle) {
+JNIEXPORT jint JNICALL Java_org_apache_mxnet_LibInfo_mxNDArrayReshape64
+  (JNIEnv *env, jobject obj, jlong ndArrayPtr, jint ndim,
+   jlongArray dims, jboolean reverse, jobject reshapedHandle) {
   NDArrayHandle out;
-  jint *pdims = env->GetIntArrayElements(dims, NULL);
-  int ret = MXNDArrayReshape(reinterpret_cast<NDArrayHandle>(ndArrayPtr), ndim,
-                                    reinterpret_cast<int *>(pdims), &out);
+  jlong *pdims = env->GetLongArrayElements(dims, NULL);
+  int ret = MXNDArrayReshape64(reinterpret_cast<NDArrayHandle>(ndArrayPtr), ndim,
+                                    reinterpret_cast<dim_t *>(pdims), reverse, &out);
   SetLongField(env, reshapedHandle, reinterpret_cast<jlong>(out));
-  env->ReleaseIntArrayElements(dims, pdims, 0);
+  env->ReleaseLongArrayElements(dims, pdims, 0);
   return ret;
 }
 
@@ -420,6 +422,15 @@ JNIEXPORT jint JNICALL Java_org_apache_mxnet_LibInfo_mxNDArraySyncCopyFromCPU
   int ret = MXNDArraySyncCopyFromCPU(reinterpret_cast<NDArrayHandle>(arrayPtr),
                                      static_cast<const mx_float *>(sourcePtr), arrSize);
   env->ReleaseFloatArrayElements(sourceArr, sourcePtr, 0);
+  return ret;
+}
+
+JNIEXPORT jint JNICALL Java_org_apache_mxnet_LibInfo_mxFloat64NDArraySyncCopyFromCPU
+  (JNIEnv *env, jobject obj, jlong arrayPtr, jdoubleArray sourceArr, jint arrSize) {
+  jdouble *sourcePtr = env->GetDoubleArrayElements(sourceArr, NULL);
+  int ret = MXNDArraySyncCopyFromCPU(reinterpret_cast<NDArrayHandle>(arrayPtr),
+                                     static_cast<const double *>(sourcePtr), arrSize);
+  env->ReleaseDoubleArrayElements(sourceArr, sourcePtr, 0);
   return ret;
 }
 
