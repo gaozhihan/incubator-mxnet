@@ -22,9 +22,9 @@
  * \file shuffle_op.cc
  * \brief Operator to shuffle elements of an NDArray
  */
-#if !defined (__ANDROID__) && ((__GNUC__ > 4 &&\
-    !defined(__clang__major__)) || (__clang_major__ > 4 && __linux__))
-        #define USE_GNU_PARALLEL_SHUFFLE
+#if ((__GNUC__ > 4 && !defined(__clang__major__)) || (__clang_major__ > 4 && __linux__)) && \
+  defined(_OPENMP) && !defined(__ANDROID__)
+#define USE_GNU_PARALLEL_SHUFFLE
 #endif
 
 #include <mxnet/operator_util.h>
@@ -33,6 +33,7 @@
 #include <vector>
 #include <cstring>
 #ifdef USE_GNU_PARALLEL_SHUFFLE
+  #include <unistd.h>
   #include <parallel/algorithm>
 #endif
 #include "../elemwise_op_common.h"
@@ -45,8 +46,13 @@ namespace {
 template<typename DType, typename Rand>
 void Shuffle1D(DType* const out, const index_t size, Rand* const prnd) {
   #ifdef USE_GNU_PARALLEL_SHUFFLE
-    auto rand_n = [prnd](index_t n) {
-      std::uniform_int_distribution<index_t> dist(0, n - 1);
+     /*
+      * See issue #15029: the data type of n needs to be compatible with
+      * the gcc library: https://github.com/gcc-mirror/gcc/blob/master/libstdc%2B%2B\
+      * -v3/include/parallel/random_shuffle.h#L384
+      */
+    auto rand_n = [prnd](uint32_t n) {
+      std::uniform_int_distribution<uint32_t> dist(0, n - 1);
       return dist(*prnd);
     };
     __gnu_parallel::random_shuffle(out, out + size, rand_n);
@@ -72,9 +78,14 @@ void ShuffleND(DType* const out, const index_t size, const index_t first_axis_le
   for (index_t i = first_axis_len - 1; i > 0; --i) {
     const index_t j = rand_n(i + 1);
     if (i != j) {
+#pragma GCC diagnostic push
+#if __GNUC__ >= 8
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
       std::memcpy(buf.dptr_, out + stride * i, stride_bytes);
       std::memcpy(out + stride * i, out + stride * j, stride_bytes);
       std::memcpy(out + stride * j, buf.dptr_, stride_bytes);
+#pragma GCC diagnostic pop
     }
   }
 }
@@ -116,6 +127,7 @@ void ShuffleForwardCPU(const nnvm::NodeAttrs& attrs,
 
 NNVM_REGISTER_OP(_shuffle)
 .add_alias("shuffle")
+.add_alias("_npi_shuffle")
 .describe(R"code(Randomly shuffle the elements.
 
 This shuffles the array along the first axis.

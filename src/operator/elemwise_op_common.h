@@ -116,10 +116,10 @@ template<typename AttrType, bool (*is_none)(const AttrType&),
          bool (*assign)(AttrType*, const AttrType&), bool reverse_infer,
          std::string (*attr_string)(const AttrType&),
          index_t n_in = -1, index_t n_out = -1>
-inline bool ElemwiseAttr(const nnvm::NodeAttrs& attrs,
-                         std::vector<AttrType> *in_attrs,
-                         std::vector<AttrType> *out_attrs,
-                         const AttrType& none) {
+inline bool ElemwiseAttrHelper(const std::string& node_name,
+                               std::vector<AttrType> *in_attrs,
+                               std::vector<AttrType> *out_attrs,
+                               const AttrType& none) {
   AttrType dattr = none;
   size_t in_size = in_attrs->size();
   size_t out_size = out_attrs->size();
@@ -133,7 +133,7 @@ inline bool ElemwiseAttr(const nnvm::NodeAttrs& attrs,
   auto deduce = [&](const std::vector<AttrType>& vec, size_t size, const char *name) {
       for (size_t i = 0; i < size; ++i) {
         CHECK(assign(&dattr, vec.at(i)))
-          << "Incompatible attr in node " << attrs.name << " at " << i << "-th "
+          << "Incompatible attr in node " << node_name << " at " << i << "-th "
           << name << ": " << "expected " << attr_string(dattr)
           << ", got " << attr_string(vec.at(i));
       }
@@ -145,7 +145,7 @@ inline bool ElemwiseAttr(const nnvm::NodeAttrs& attrs,
   auto write = [&](std::vector<AttrType> *vec, size_t size, const char *name) {
       for (size_t i = 0; i < size; ++i) {
         CHECK(assign(&(vec->at(i)), dattr))
-          << "Incompatible attr in node " << attrs.name << " at " << i << "-th "
+          << "Incompatible attr in node " << node_name << " at " << i << "-th "
           << name << ": " << "expected " << attr_string(dattr)
           << ", got " << attr_string(vec->at(i));
       }
@@ -156,6 +156,21 @@ inline bool ElemwiseAttr(const nnvm::NodeAttrs& attrs,
   if (is_none(dattr))
       return false;
   return true;
+}
+
+
+template<typename AttrType, bool (*is_none)(const AttrType&),
+         bool (*assign)(AttrType*, const AttrType&), bool reverse_infer,
+         std::string (*attr_string)(const AttrType&),
+         index_t n_in = -1, index_t n_out = -1>
+inline bool ElemwiseAttr(const nnvm::NodeAttrs& attrs,
+                         std::vector<AttrType> *in_attrs,
+                         std::vector<AttrType> *out_attrs,
+                         const AttrType& none) {
+  return ElemwiseAttrHelper<AttrType, is_none,
+                            assign, reverse_infer,
+                            attr_string, n_in,
+                            n_out>(attrs.name, in_attrs, out_attrs, none);
 }
 
 template<index_t n_in, index_t n_out>
@@ -186,10 +201,30 @@ inline bool ElemwiseType(const nnvm::NodeAttrs& attrs,
     attrs, in_attrs, out_attrs, -1);
 }
 
+// Special case of ElemwiseType. Constrains dtype to integer types
+template<index_t n_in, index_t n_out>
+inline bool ElemwiseIntType(const nnvm::NodeAttrs& attrs,
+                            std::vector<int> *in_attrs,
+                            std::vector<int> *out_attrs) {
+  CHECK(in_attrs->at(0) == mshadow::kInt64 ||
+        in_attrs->at(0) == mshadow::kInt32 ||
+        in_attrs->at(0) == mshadow::kInt8 ||
+        in_attrs->at(0) == mshadow::kUint8 ||
+        in_attrs->at(0) == mshadow::kBool) << "Only supports integer types.";
+  if (n_in != -1) {
+    CHECK_EQ(in_attrs->size(), static_cast<size_t>(n_in)) << " in operator " << attrs.name;
+  }
+  if (n_out != -1) {
+    CHECK_EQ(out_attrs->size(), static_cast<size_t>(n_out)) << " in operator " << attrs.name;
+  }
+  return ElemwiseAttr<int, type_is_none, type_assign, true, type_string>(
+    attrs, in_attrs, out_attrs, -1);
+}
+
 // Transfer gradient and input to FGradient function
 struct ElemwiseGradUseIn {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     return MakeNonlossGradNode(op_name, n, ograds, n->inputs, n->attrs.dict);
   }
@@ -198,12 +233,12 @@ struct ElemwiseGradUseIn {
 // Transfer gradient and output to FGradient function
 struct ElemwiseGradUseOut {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> heads;
     uint32_t n_out = n->num_outputs();
     for (uint32_t i = 0; i < n_out; ++i) {
-      heads.emplace_back(nnvm::NodeEntry{n, i, 0});
+      heads.emplace_back(n, i, 0);
     }
     return MakeNonlossGradNode(op_name, n, ograds, heads, n->attrs.dict);
   }
@@ -212,7 +247,7 @@ struct ElemwiseGradUseOut {
 // Transfer gradient and input and output to FGradient function
 struct ElemwiseGradUseInOut {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
     for (auto& h : n->inputs) {
@@ -220,7 +255,7 @@ struct ElemwiseGradUseInOut {
     }
     uint32_t n_out = n->num_outputs();
     for (uint32_t i = 0; i < n_out; ++i) {
-      heads.emplace_back(nnvm::NodeEntry{n, i, 0});
+      heads.emplace_back(n, i, 0);
     }
     return MakeGradNode(op_name, n, heads, n->attrs.dict);
   }
@@ -229,7 +264,7 @@ struct ElemwiseGradUseInOut {
 // Transfer only gradient to FGradient function
 struct ElemwiseGradUseNone {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     return MakeNonlossGradNode(op_name, n, ograds, {}, n->attrs.dict);
   }
@@ -237,7 +272,7 @@ struct ElemwiseGradUseNone {
 
 struct CloneGradient {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> ret;
     const size_t input_count = n->inputs.size();

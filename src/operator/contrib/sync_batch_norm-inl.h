@@ -482,7 +482,7 @@ class SyncBatchNormProp : public OperatorProperty {
     using namespace mshadow;
     CHECK_EQ(in_shape->size(), 3U) << "Input:[data, gamma, beta]";
     const mxnet::TShape &dshape = in_shape->at(0);
-    if (dshape.ndim() == 0) return false;
+    if (mxnet::op::shape_is_none(dshape)) return false;
     in_shape->at(1) = mxnet::TShape(Shape1(dshape[1]));
     in_shape->at(2) = mxnet::TShape(Shape1(dshape[1]));
     out_shape->clear();
@@ -581,7 +581,7 @@ class SyncBatchNormProp : public OperatorProperty {
 
   Operator* CreateOperator(Context ctx) const override {
       LOG(FATAL) << "Not Implemented.";
-      return NULL;
+      return nullptr;
   }
 
   Operator* CreateOperatorEx(Context ctx, mxnet::ShapeVector *in_shape,

@@ -25,16 +25,14 @@
 #include "./fully_connected-inl.h"
 #include "./mkldnn/mkldnn_ops-inl.h"
 #include "./mkldnn/mkldnn_base-inl.h"
-#if MXNET_USE_NNPACK == 1
-#include "../nnpack/nnpack_fully_connected-inl.h"
-#endif  // MXNET_USE_NNPACK
 
 namespace mxnet {
 namespace op {
 
 bool SupportMKLDNNFC(const NDArray& input) {
   int ndim = input.shape().ndim();
-  return input.dtype() == mshadow::kFloat32 && (ndim >= 1 && ndim <= 4) &&
+  return (input.dtype() == mshadow::kFloat32 || input.dtype() == mshadow::kBfloat16) &&
+         (ndim >= 1 && ndim <= 4) &&
          input.storage_type() == kDefaultStorage;
 }
 
@@ -52,7 +50,7 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
   mxnet::TShape dshape = (*in_shape)[fullc::kData];
   mxnet::TShape oshape = (*out_shape)[0];
   // require data to be known
-  if (dshape.ndim() ==  0) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
 
   index_t num_input;
   if (!param.flatten) {
@@ -75,7 +73,7 @@ static bool FullyConnectedShape(const nnvm::NodeAttrs& attrs,
   } else {
     SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
   }
-  if (oshape.ndim() != 0) {
+  if (oshape.ndim() > 0) {
     dshape[0] = oshape[0];
     SHAPE_ASSIGN_CHECK(*in_shape, fullc::kData, dshape);
   }
@@ -97,12 +95,12 @@ void FullyConnectedComputeExCPU(const nnvm::NodeAttrs& attrs,
     valid_bias = inputs[2].storage_type() == kDefaultStorage ||
                  inputs[2].storage_type() == kRowSparseStorage;
   }
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (common::ContainsOnlyStorage(inputs, kDefaultStorage) &&
       common::ContainsOnlyStorage(outputs, kDefaultStorage)) {
     if (SupportMKLDNNFC(inputs[0])) {
       MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
-      MKLDNNFCForward(attrs, ctx, inputs, req, outputs);
+      MKLDNNRun(MKLDNNFCForward, attrs, ctx, inputs, req, outputs);
       MKLDNN_OPCHECK_RUN(FullyConnectedCompute<cpu>, attrs, ctx, inputs, req,
                          outputs);
     } else {
@@ -141,7 +139,7 @@ void FullyConnectedComputeExCPU(const nnvm::NodeAttrs& attrs,
 #endif
 }
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 void FullyConnectedGradComputeExCPU(const nnvm::NodeAttrs& attrs,
                                     const OpContext &ctx,
                                     const std::vector<NDArray> &inputs,
@@ -149,7 +147,7 @@ void FullyConnectedGradComputeExCPU(const nnvm::NodeAttrs& attrs,
                                     const std::vector<NDArray> &outputs) {
   if (SupportMKLDNNFC(inputs[0])) {
     MKLDNN_OPCHECK_INIT(true, outputs.size(), inputs, outputs);
-    MKLDNNFCBackward(attrs, ctx, inputs, req, outputs);
+    MKLDNNRun(MKLDNNFCBackward, attrs, ctx, inputs, req, outputs);
     MKLDNN_OPCHECK_RUN(FullyConnectedGradCompute<cpu>, attrs, ctx, inputs, req,
                        outputs);
     return;
@@ -167,7 +165,7 @@ static bool FullyConnectedType(const nnvm::NodeAttrs& attrs,
 
 struct FullyConnectedGrad {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
     heads.push_back(n->inputs[fullc::kData]);
@@ -176,11 +174,21 @@ struct FullyConnectedGrad {
   }
 };
 
-inline static bool FCStorageType(const nnvm::NodeAttrs& attrs,
-                                 const int dev_mask,
-                                 DispatchMode* dispatch_mode,
-                                 std::vector<int> *in_attrs,
-                                 std::vector<int> *out_attrs) {
+struct FullyConnectedGradGrad {
+  const char *op_name;
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
+                                          const std::vector<nnvm::NodeEntry>& ograds) const {
+    std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
+    heads.push_back(n->inputs[0]);  // o_y : head gradient of the output y
+    return MakeGradNode(op_name, n, heads, n->attrs.dict);
+  }
+};
+
+static bool FCStorageType(const nnvm::NodeAttrs& attrs,
+                          const int dev_mask,
+                          DispatchMode* dispatch_mode,
+                          std::vector<int> *in_attrs,
+                          std::vector<int> *out_attrs) {
   const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
   const bool valid_data = in_attrs->at(0) == kDefaultStorage;
   const bool valid_weight = in_attrs->at(1) == kDefaultStorage ||
@@ -199,7 +207,7 @@ inline static bool FCStorageType(const nnvm::NodeAttrs& attrs,
     dispatched = storage_type_assign(out_attrs, mxnet::kDefaultStorage,
                                      dispatch_mode, DispatchMode::kFComputeEx);
   }
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (!MKLDNNEnvSet())
     *dispatch_mode = DispatchMode::kFComputeFallback;
 #endif
@@ -210,21 +218,19 @@ inline static bool FCStorageType(const nnvm::NodeAttrs& attrs,
   return dispatched;
 }
 
-inline static bool BackwardFCStorageType(const nnvm::NodeAttrs& attrs,
-                                         const int dev_mask,
-                                         DispatchMode* dispatch_mode,
-                                         std::vector<int> *in_attrs,
-                                         std::vector<int> *out_attrs) {
+static bool BackwardFCStorageType(const nnvm::NodeAttrs& attrs,
+                                  const int dev_mask,
+                                  DispatchMode* dispatch_mode,
+                                  std::vector<int> *in_attrs,
+                                  std::vector<int> *out_attrs) {
   const FullyConnectedParam& param = nnvm::get<FullyConnectedParam>(attrs.parsed);
   uint32_t out_expected = param.no_bias ? 2 : 3;
   CHECK_EQ(in_attrs->size(), 3U);
   CHECK_EQ(out_attrs->size(), out_expected);
-  // TODO(zhengda) let's disable MKLDNN for FullyConnected for now.
-  // It seems there is a bug.
   bool dispatched = false;
   if (!dispatched && common::ContainsOnlyStorage(*in_attrs, mxnet::kDefaultStorage)) {
     dispatched = storage_type_assign(out_attrs, mxnet::kDefaultStorage,
-                                     dispatch_mode, DispatchMode::kFCompute);
+                                     dispatch_mode, DispatchMode::kFComputeEx);
   }
   if (!dispatched && common::ContainsStorageType(*in_attrs, mxnet::kRowSparseStorage)) {
     dispatched = dispatch_fallback(out_attrs, dispatch_mode);
@@ -233,7 +239,7 @@ inline static bool BackwardFCStorageType(const nnvm::NodeAttrs& attrs,
     dispatched = storage_type_assign(out_attrs, mxnet::kDefaultStorage,
                                      dispatch_mode, DispatchMode::kFCompute);
   }
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (!MKLDNNEnvSet())
     *dispatch_mode = DispatchMode::kFComputeFallback;
 #endif
@@ -244,6 +250,7 @@ DMLC_REGISTER_PARAMETER(FullyConnectedParam);
 
 NNVM_REGISTER_OP(FullyConnected)
 MXNET_ADD_SPARSE_OP_ALIAS(FullyConnected)
+.add_alias("_npx_fully_connected")
 .describe(R"code(Applies a linear transformation: :math:`Y = XW^T + b`.
 
 If ``flatten`` is set to be true, then the shapes are:
@@ -294,12 +301,13 @@ If ``no_bias`` is set to be true, then the ``bias`` term is ignored.
     [](const NodeAttrs& attrs) {
     return std::vector<std::string>{"output"};
 })
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
   return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
 })
 #endif
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<mxnet::FInferShape>("FInferShape", FullyConnectedShape)
 .set_attr<nnvm::FInferType>("FInferType", FullyConnectedType)
 .set_attr<FCompute>("FCompute<cpu>", FullyConnectedCompute<cpu>)
@@ -316,22 +324,46 @@ NNVM_REGISTER_OP(_backward_FullyConnected)
   const FullyConnectedParam& params = nnvm::get<FullyConnectedParam>(attrs.parsed);
   return params.no_bias ? 2 : 3;
 })
-#if MXNET_USE_MKLDNN == 1
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
   return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
 })
-#endif
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
 .set_attr<nnvm::FInplaceOption>("FInplaceOption", [](const NodeAttrs& attrs){
   return std::vector<std::pair<int, int> >{{1, 0}};
 })
+.set_attr<nnvm::FGradient>("FGradient", FullyConnectedGradGrad{"_backward_backward_FullyConnected"})
 .set_attr<FInferStorageType>("FInferStorageType", BackwardFCStorageType)
 .set_attr_parser(ParamParser<FullyConnectedParam>)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FComputeEx>("FComputeEx<cpu>", FullyConnectedGradComputeExCPU)
 #endif
 .set_attr<FCompute>("FCompute<cpu>", FullyConnectedGradCompute<cpu>);
+
+// 2nd gradient for fully connected
+// Inputs are:
+// o_x_grad : head gradient for x_grad
+// o_w_grad : head gradient for w_grad
+// o_b_grad : if param.no_bias is false
+// o_y : head gradient of y
+//
+// outputs are:
+// o_y_grad : not used
+// x_grad_grad : o_w_grad * o_y^T
+// w_grad_grad : o_x_grad * o_y
+//
+// For a detailed development of the second gradient see here: TODO(larroy)
+NNVM_REGISTER_OP(_backward_backward_FullyConnected)
+.set_num_inputs([](const NodeAttrs& attrs) {
+  const FullyConnectedParam& params = nnvm::get<FullyConnectedParam>(attrs.parsed);
+  return params.no_bias ? 3 : 4;
+})
+.set_num_outputs([](const NodeAttrs& attrs) {
+  return 3;
+})
+.set_attr<nnvm::TIsBackward>("TIsBackward", true)
+.set_attr_parser(ParamParser<FullyConnectedParam>)
+.set_attr<FCompute>("FCompute<cpu>", FullyConnectedGradGradDTypeDispatch<cpu>);
 
 }  // namespace op
 }  // namespace mxnet

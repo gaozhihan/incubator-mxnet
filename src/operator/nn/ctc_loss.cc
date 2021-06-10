@@ -50,6 +50,7 @@ DMLC_REGISTER_PARAMETER(CTCLossOpParam);
 
 NNVM_REGISTER_OP(CTCLoss)
 .add_alias("ctc_loss")
+.add_alias("_npx_ctc_loss")
 .add_alias("_contrib_CTCLoss")
 .add_alias("_contrib_ctc_loss")
 .describe(R"code(Connectionist Temporal Classification Loss.
@@ -115,6 +116,7 @@ information on the definition and the algorithm.
 .set_attr<FInferStorageType>("FInferStorageType", CTCLossOpStorageType)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs)
   { return std::vector<ResourceRequest>{ResourceRequest::kTempSpace}; })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<FCompute>("FCompute<cpu>", CTCLossOpForward<cpu>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseOut{"_backward_ctc_loss"})
 .add_argument("data", "NDArray-or-Symbol", "Input ndarray")
@@ -129,7 +131,7 @@ information on the definition and the algorithm.
 
 NNVM_REGISTER_OP(_backward_ctc_loss)
 .set_attr_parser(ParamParser<CTCLossOpParam>)
-.set_num_inputs(1)
+.set_num_inputs(4)
 .set_num_outputs(CTCLossOpNumInputs)
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
 .set_attr<FCompute>("FCompute<cpu>", CTCLossOpBackward<cpu>);

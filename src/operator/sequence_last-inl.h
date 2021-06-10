@@ -66,24 +66,24 @@ struct SequenceLastParam : public dmlc::Parameter<SequenceLastParam> {
 template <int req>
 struct SequenceLastKernel {
   template <typename DType, typename IType>
-  MSHADOW_XINLINE static void Map(int i, DType *out, const DType *in,
-                                  const IType *idx, int offset1, int offset2,
+  MSHADOW_XINLINE static void Map(index_t i, DType *out, const DType *in,
+                                  const IType *idx, index_t offset1, index_t offset2,
                                   mshadow::Shape<2> oshape) {
     const auto opos = mxnet_op::unravel(i, oshape);
-    const int seqpos = static_cast<int>(idx[opos[0]]) - 1;
-    const int ipos = seqpos * offset1 + opos[0] * offset2 + opos[1];
+    const index_t seqpos = static_cast<index_t>(idx[opos[0]]) - 1;
+    const index_t ipos = seqpos * offset1 + opos[0] * offset2 + opos[1];
     KERNEL_ASSIGN(out[i], req, in[ipos]);
   }
 };
 
 struct SequenceLastGradKernel {
   template <typename DType, typename IType>
-  MSHADOW_XINLINE static void Map(int i, DType *in_grad, const DType *out_grad,
-                                  const IType *idx, int offset1, int offset2,
+  MSHADOW_XINLINE static void Map(index_t i, DType *in_grad, const DType *out_grad,
+                                  const IType *idx, index_t offset1, index_t offset2,
                                   mshadow::Shape<2> oshape) {
     const auto opos = mxnet_op::unravel(i, oshape);
-    const int seqpos = static_cast<int>(idx[opos[0]]) - 1;
-    const int ipos = seqpos * offset1 + opos[0] * offset2 + opos[1];
+    const index_t seqpos = static_cast<index_t>(idx[opos[0]]) - 1;
+    const index_t ipos = seqpos * offset1 + opos[0] * offset2 + opos[1];
     in_grad[ipos] += out_grad[i];
   }
 };
@@ -101,10 +101,10 @@ class SequenceLastOp : public Operator {
     using namespace mshadow::expr;
 
     int axis = param_.axis;
-    int out_size = out.size(0) * out.size(1);
-    int max_seq_len = data.size(axis);
-    int offset1 = axis ? out.size(1) : out_size;
-    int offset2 = axis ? (max_seq_len * out.size(1)) : out.size(1);
+    index_t out_size = out.size(0) * out.size(1);
+    index_t max_seq_len = data.size(axis);
+    index_t offset1 = axis ? out.size(1) : out_size;
+    index_t offset2 = axis ? (max_seq_len * out.size(1)) : out.size(1);
 
     MXNET_ASSIGN_REQ_SWITCH(req, req_type, {
       mxnet_op::Kernel<SequenceLastKernel<req_type>, xpu>::Launch(
@@ -121,13 +121,13 @@ class SequenceLastOp : public Operator {
     using namespace mshadow::expr;
 
     auto axis = param_.axis;
-    int batch = out_grad.size(0);
-    int rest = out_grad.size(1);
-    int out_size = batch * rest;
+    index_t batch = out_grad.size(0);
+    index_t rest = out_grad.size(1);
+    index_t out_size = batch * rest;
 
-    int max_seq_len = in_grad.size(axis);
-    int offset1 = axis ? rest : out_size;
-    int offset2 = axis ? (max_seq_len * rest) : rest;
+    index_t max_seq_len = in_grad.size(axis);
+    index_t offset1 = axis ? rest : out_size;
+    index_t offset2 = axis ? (max_seq_len * rest) : rest;
 
     mxnet_op::Kernel<SequenceLastGradKernel, xpu>::Launch(
         s, out_size, in_grad.dptr_, out_grad.dptr_, indices.dptr_, offset1,
@@ -152,6 +152,10 @@ class SequenceLastOp : public Operator {
     auto d0 = in_data[seq_last::kData].size(0);
     auto d1 = in_data[seq_last::kData].size(1);
     auto dsize = in_data[seq_last::kData].Size();
+
+    if (dsize == 0) {
+      return;  // noop if any input dimension is zero-sized, out_data is of a right shape
+    }
 
     auto batch = (axis != 0) ? d0 : d1;
     auto max_seq_len = in_data[seq_last::kData].size(axis);
@@ -263,7 +267,7 @@ class SequenceLastProp : public OperatorProperty {
       SHAPE_ASSIGN_CHECK(*in_shape, seq_last::kSequenceLength, Shape1(sbatch));
 
     // calculate output size
-    mxnet::TShape shape_o(dshape.ndim() - 1);
+    mxnet::TShape shape_o(dshape.ndim() - 1, -1);
     shape_o[0] = sbatch;
     for (index_t i = 1; i < shape_o.ndim(); ++i) shape_o[i] = dshape[i + 1];
 
@@ -317,7 +321,7 @@ class SequenceLastProp : public OperatorProperty {
 
   Operator *CreateOperator(Context ctx) const override {
     LOG(FATAL) << "Not Implemented.";
-    return NULL;
+    return nullptr;
   }
 
   Operator *CreateOperatorEx(Context ctx, mxnet::ShapeVector *in_shape,

@@ -28,16 +28,20 @@
 #include <mxnet/base.h>
 #include <mxnet/operator_util.h>
 #include <mxnet/op_attr_types.h>
+#include <mxnet/imperative.h>
 #include <dmlc/parameter.h>
 #include <dmlc/optional.h>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <limits>
+#include "../../api/operator/op_utils.h"
+#include "../../common/utils.h"
 #include "../mshadow_op.h"
 #include "../elemwise_op_common.h"
 #include "../mxnet_op.h"
 #include "../mshadow_op.h"
+#include "../../api/operator/op_utils.h"
 
 
 namespace mxnet {
@@ -49,15 +53,25 @@ struct InitOpParam : public dmlc::Parameter<InitOpParam> {
   int dtype;
   DMLC_DECLARE_PARAMETER(InitOpParam) {
     DMLC_DECLARE_FIELD(shape)
-    .set_default(mxnet::TShape())
+    .set_default(mxnet::TShape(0, 1))
     .describe("The shape of the output");
     DMLC_DECLARE_FIELD(ctx)
     .set_default("")
     .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
               "Only used for imperative calls.");
-    DMLC_DECLARE_FIELD(dtype).set_default(mshadow::kFloat32)
-    MXNET_ADD_ALL_TYPES
+    DMLC_DECLARE_FIELD(dtype)
+    .set_default(-1)
+    .add_enum("None", -1)
+    MXNET_ADD_ALL_TYPES_WITH_BOOL
     .describe("Target data type.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream shape_s;
+    shape_s << shape;
+    (*dict)["shape"] = shape_s.str();
+    (*dict)["dtype"] = MXNetTypeWithBool2String(dtype);
+    // We do not set ctx, because ctx has been set in dict instead of InitOpParam.
+    // Setting ctx here results in an error.
   }
 };
 
@@ -78,6 +92,51 @@ struct InitOpWithoutDTypeParam : public dmlc::Parameter<InitOpWithoutDTypeParam>
     .describe("Target data type.");
   }
 };
+
+struct FullLikeOpParam : public dmlc::Parameter<FullLikeOpParam> {
+  double fill_value;
+  std::string ctx;
+  dmlc::optional<int> dtype;
+  DMLC_DECLARE_PARAMETER(FullLikeOpParam) {
+    DMLC_DECLARE_FIELD(fill_value)
+      .describe("Value with which to fill newly created tensor");
+    DMLC_DECLARE_FIELD(ctx)
+      .set_default("")
+      .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
+                "Only used for imperative calls.");
+    DMLC_DECLARE_FIELD(dtype)
+      .set_default(dmlc::optional<int>())
+      MXNET_ADD_ALL_TYPES_WITH_BOOL
+      .describe("Target data type.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream fill_value_s, dtype_s;
+    fill_value_s << fill_value;
+    dtype_s << dtype;
+    (*dict)["fill_value"] = fill_value_s.str();
+    if (dtype.has_value()) {
+      (*dict)["dtype"] = MXNetTypeWithBool2String(dtype.value());
+    } else {
+      (*dict)["dtype"] = dtype_s.str();
+    }
+  }
+};
+
+/*! \brief Infer type of FullLikeOpCompute*/
+template<typename ParamType>
+inline bool FullLikeOpType(const nnvm::NodeAttrs& attrs,
+                           std::vector<int> *in_attrs,
+                           std::vector<int> *out_attrs) {
+  const ParamType& param = nnvm::get<ParamType>(attrs.parsed);
+  CHECK_EQ(in_attrs->size(), 1U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  if (param.dtype.has_value()) {
+    TYPE_ASSIGN_CHECK(*out_attrs, 0, param.dtype.value());
+  } else {
+    TYPE_ASSIGN_CHECK(*out_attrs, 0, in_attrs->at(0));
+  }
+  return out_attrs->at(0) != -1;;
+}
 
 struct EyeParam : public dmlc::Parameter<EyeParam> {
   nnvm::dim_t N;
@@ -101,14 +160,10 @@ struct EyeParam : public dmlc::Parameter<EyeParam> {
     .set_default("")
     .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
               "Only used for imperative calls.");
-    DMLC_DECLARE_FIELD(dtype).set_default(mshadow::kFloat32)
-    .add_enum("float32", mshadow::kFloat32)
-    .add_enum("float64", mshadow::kFloat64)
-    .add_enum("float16", mshadow::kFloat16)
-    .add_enum("uint8", mshadow::kUint8)
-    .add_enum("int8", mshadow::kInt8)
-    .add_enum("int32", mshadow::kInt32)
-    .add_enum("int64", mshadow::kInt64)
+    DMLC_DECLARE_FIELD(dtype)
+    .set_default(-1)
+    .add_enum("None", -1)
+    MXNET_ADD_ALL_TYPES
     .describe("Target data type.");
   }
 };
@@ -167,9 +222,67 @@ struct RangeParam : public dmlc::Parameter<RangeParam> {
     .set_default("")
     .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
               "Only used for imperative calls.");
-    DMLC_DECLARE_FIELD(dtype).set_default(mshadow::kFloat32)
+    DMLC_DECLARE_FIELD(dtype)
+    .set_default(-1)
+    .add_enum("None", -1)
     MXNET_ADD_ALL_TYPES
     .describe("Target data type.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream start_s, stop_s, step_s, repeat_s, infer_range_s, dtype_s;
+    start_s << start;
+    stop_s << stop;
+    step_s << step;
+    repeat_s << repeat;
+    infer_range_s << infer_range;
+    dtype_s << dtype;
+    (*dict)["start"] = start_s.str();
+    (*dict)["stop"] = stop_s.str();
+    (*dict)["step"] = step_s.str();
+    (*dict)["repeat"] = repeat_s.str();
+    (*dict)["infer_range"] = infer_range_s.str();
+    (*dict)["dtype"] = MXNetTypeWithBool2String(dtype);
+  }
+};
+
+struct RangeLikeParam : public dmlc::Parameter<RangeLikeParam> {
+  double start;
+  double step;
+  int repeat;
+  std::string ctx;
+  dmlc::optional<int> axis;
+
+  DMLC_DECLARE_PARAMETER(RangeLikeParam) {
+    DMLC_DECLARE_FIELD(start)
+    .set_default(0)
+    .describe("Start of interval. The interval includes this value. The default start value is 0.");
+    DMLC_DECLARE_FIELD(step)
+    .set_default(1)
+    .describe("Spacing between values.");
+    DMLC_DECLARE_FIELD(repeat)
+    .set_default(1)
+    .describe("The repeating time of all elements."
+              " E.g repeat=3, the element a will be repeated three times --> a, a, a.");
+    DMLC_DECLARE_FIELD(ctx)
+    .set_default("")
+    .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
+              "Only used for imperative calls.");
+    DMLC_DECLARE_FIELD(axis)
+    .set_default(dmlc::optional<int>())
+    .describe("Arange elements according to the size of a certain axis of input array."
+              " The negative numbers are interpreted counting from the backward."
+              " If not provided, will arange elements according to the input shape.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream start_s, step_s, repeat_s, axis_s;
+    start_s << start;
+    step_s << step;
+    repeat_s << repeat;
+    axis_s << axis;
+    (*dict)["start"] = start_s.str();
+    (*dict)["step"] = step_s.str();
+    (*dict)["repeat"] = repeat_s.str();
+    (*dict)["axis"] = axis_s.str();
   }
 };
 
@@ -187,11 +300,25 @@ struct InitOpWithScalarParam : dmlc::Parameter<InitOpWithScalarParam> {
       .set_default("")
       .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
                   "Only used for imperative calls.");
-    DMLC_DECLARE_FIELD(dtype).set_default(mshadow::kFloat32)
-      MXNET_ADD_ALL_TYPES
+    DMLC_DECLARE_FIELD(dtype)
+      .set_default(-1)
+      .add_enum("None", -1)
+      MXNET_ADD_ALL_TYPES_WITH_BOOL
       .describe("Target data type.");
     DMLC_DECLARE_FIELD(value)
       .describe("Value with which to fill newly created tensor");
+  }
+
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream shape_s, dtype_s, value_s;
+    shape_s << shape;
+    dtype_s << dtype;
+    value_s << value;
+    (*dict)["shape"] = shape_s.str();
+    (*dict)["dtype"] = MXNetTypeWithBool2String(dtype);
+    (*dict)["value"] = value_s.str();
+    // We do not set ctx, because ctx has been set in dict instead of InitOpParam.
+    // Setting ctx here results in an error.
   }
 };
 
@@ -206,6 +333,48 @@ inline void RangeParamParser(nnvm::NodeAttrs* attrs) {
   attrs->parsed = std::move(param);
 }
 
+struct LinspaceParam : public dmlc::Parameter<LinspaceParam> {
+  double start;
+  double stop;
+  index_t num;
+  bool endpoint;
+  std::string ctx;
+  int dtype;
+  DMLC_DECLARE_PARAMETER(LinspaceParam) {
+    DMLC_DECLARE_FIELD(start)
+    .describe("The starting value of the sequence.");
+    DMLC_DECLARE_FIELD(stop)
+    .describe("The ending value of the sequence");
+    DMLC_DECLARE_FIELD(num)
+    .describe("Number of samples to generate. Must be non-negative.");
+    DMLC_DECLARE_FIELD(endpoint)
+    .set_default(true)
+    .describe("If True, stop is the last sample. Otherwise, it is not included.");
+    DMLC_DECLARE_FIELD(ctx)
+    .set_default("")
+    .describe("Context of output, in format [cpu|gpu|cpu_pinned](n)."
+              "Only used for imperative calls.");
+    DMLC_DECLARE_FIELD(dtype)
+    .set_default(-1)
+    .add_enum("None", -1)
+    MXNET_ADD_ALL_TYPES
+    .describe("Target data type.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream start_s, stop_s, num_s, endpoint_s, dtype_s;
+    start_s << start;
+    stop_s << stop;
+    num_s << num;
+    endpoint_s << endpoint;
+    dtype_s << dtype;
+    (*dict)["start"] = start_s.str();
+    (*dict)["stop"] = stop_s.str();
+    (*dict)["num"] = num_s.str();
+    (*dict)["endpoint"] = endpoint_s.str();
+    (*dict)["dtype"] = MXNetTypeWithBool2String(dtype);
+  }
+};
+
 template<typename ParamType>
 inline bool InitShape(const nnvm::NodeAttrs& attrs,
                       mxnet::ShapeVector *in_attrs,
@@ -213,24 +382,46 @@ inline bool InitShape(const nnvm::NodeAttrs& attrs,
   const ParamType& param = nnvm::get<ParamType>(attrs.parsed);
   CHECK_EQ(in_attrs->size(), 0U);
   CHECK_EQ(out_attrs->size(), 1U);
-  if ((*out_attrs)[0].ndim() != 0 && param.shape.ndim() == 0) return true;
-  for (unsigned int i=0 ; i < param.shape.ndim() ; ++i) {
-    if (param.shape[i] < 0U) {
-      LOG(FATAL) << "Shape cannot contain negative values " << param.shape;
-    }
+  mxnet::TShape param_shape = param.shape;
+  if (shape_is_known(param_shape) && !features::is_enabled(features::INT64_TENSOR_SIZE)) {
+    CHECK_LT(param_shape.Size(), (int64_t{1} << 31) - 1) <<
+              "[InitShape-input] Size of tensor you are trying to allocate is larger than "
+              "2^31 elements. Please build with flag USE_INT64_TENSOR_SIZE=1";
   }
-  SHAPE_ASSIGN_CHECK(*out_attrs, 0, param.shape);
-  return true;
+  if (!Imperative::Get()->is_np_shape()) {
+    common::ConvertToNumpyShape(&param_shape);
+  }
+  if (shape_is_known((*out_attrs)[0]) && !shape_is_known(param_shape)) {
+    if (!features::is_enabled(features::INT64_TENSOR_SIZE)) {
+      CHECK_LT(out_attrs->at(0).Size() , (int64_t{1} << 31) - 1) <<
+                "[InitShape-output] Size of tensor you are trying to allocate is larger than "
+                "2^31 elements. Please build with flag USE_INT64_TENSOR_SIZE=1";
+    }
+    return true;
+  }
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, param_shape);
+  return shape_is_known(out_attrs->at(0));
 }
 
-template<typename ParamType>
+template<typename ParamType, int num_in = 0U>
 inline bool InitType(const nnvm::NodeAttrs& attrs,
                        std::vector<int> *in_attrs,
                        std::vector<int> *out_attrs) {
   const ParamType& param = nnvm::get<ParamType>(attrs.parsed);
-  CHECK_EQ(in_attrs->size(), 0U);
+  CHECK_EQ(in_attrs->size(), num_in);
   CHECK_EQ(out_attrs->size(), 1U);
   TYPE_ASSIGN_CHECK(*out_attrs, 0, param.dtype);
+  return true;
+}
+
+template<typename ParamType, int num_in = 0U>
+inline bool InitNumpyType(const nnvm::NodeAttrs& attrs,
+                          std::vector<int> *in_attrs,
+                          std::vector<int> *out_attrs) {
+  const ParamType& param = nnvm::get<ParamType>(attrs.parsed);
+  CHECK_EQ(in_attrs->size(), num_in);
+  CHECK_EQ(out_attrs->size(), 1U);
+  TYPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::common::GetDefaultDtype(param.dtype));
   return true;
 }
 
@@ -278,17 +469,24 @@ inline bool InitStorageType(const nnvm::NodeAttrs& attrs,
  */
 template <bool is_integer = false, typename ValueType, typename xpu>
 void Fill(mshadow::Stream<xpu> *s, const TBlob& b, const OpReqType req, ValueType val) {
+  // If b is a zero-size tensor, do nothing.
+  if (!features::is_enabled(features::INT64_TENSOR_SIZE)) {
+    CHECK_LT(b.Size(), (int64_t{1} << 31) - 1) <<
+              "[Fill] Size of tensor you are trying to allocate is larger than "
+              "2^31 elements. Please build with flag USE_INT64_TENSOR_SIZE=1";
+  }
+  if (b.Size() == 0) return;
   if (req != kNullOp) {
     const size_t size = b.Size();
     if (val == 0) {
       if (req != kAddTo) {
         if (b.dev_mask() == cpu::kDevMask && size < 50000) {
-          MSHADOW_TYPE_SWITCH(b.type_flag_, DType, {
+          MSHADOW_TYPE_SWITCH_WITH_BOOL(b.type_flag_, DType, {
             memset(b.dptr_, 0, size * sizeof(DType));
           });
         } else {
           // Optimize common use-case of filling with ones
-          MSHADOW_TYPE_SWITCH(b.type_flag_, DType, {
+          MSHADOW_TYPE_SWITCH_WITH_BOOL(b.type_flag_, DType, {
             MXNET_ASSIGN_REQ_SWITCH(req, Req, {
               mxnet_op::Kernel<mxnet_op::op_with_req<mxnet_op::set_to_int<0>, Req>, xpu>::Launch(
                 s, b.Size(), b.dptr<DType>());
@@ -298,7 +496,7 @@ void Fill(mshadow::Stream<xpu> *s, const TBlob& b, const OpReqType req, ValueTyp
       }
     } else if (is_integer && val == 1) {
       // Optimize common use-case of filling with ones
-      MSHADOW_TYPE_SWITCH(b.type_flag_, DType, {
+      MSHADOW_TYPE_SWITCH_WITH_BOOL(b.type_flag_, DType, {
         MXNET_ASSIGN_REQ_SWITCH(req, Req, {
           mxnet_op::Kernel<mxnet_op::op_with_req<mxnet_op::set_one, Req>, xpu>::Launch(
             s, b.Size(), b.dptr<DType>());
@@ -306,7 +504,7 @@ void Fill(mshadow::Stream<xpu> *s, const TBlob& b, const OpReqType req, ValueTyp
       });
     } else {
       // Generic fill kernel from variable
-      MSHADOW_TYPE_SWITCH(b.type_flag_, DType, {
+      MSHADOW_TYPE_SWITCH_WITH_BOOL(b.type_flag_, DType, {
         MXNET_ASSIGN_REQ_SWITCH(req, Req, {
           mxnet_op::Kernel<mxnet_op::op_with_req<mshadow_op::identity, Req>, xpu>::Launch(
             s, b.Size(), b.dptr<DType>(), static_cast<DType>(val));
@@ -324,6 +522,19 @@ void FillCompute(const nnvm::NodeAttrs& attrs,
                  const std::vector<OpReqType>& req,
                  const std::vector<TBlob>& outputs) {
   Fill<true>(ctx.get_stream<xpu>(), outputs[0], req[0], value);
+}
+
+/*! \brief Fill output with a scalar integer value */
+template<typename xpu>
+void FullLikeOpCompute(const nnvm::NodeAttrs& attrs,
+                       const OpContext& ctx,
+                       const std::vector<TBlob>& inputs,
+                       const std::vector<OpReqType>& req,
+                       const std::vector<TBlob>& outputs) {
+  CHECK_EQ(inputs.size(), 1U);
+  CHECK_EQ(outputs.size(), 1U);
+  const auto& param = nnvm::get<FullLikeOpParam>(attrs.parsed);
+  Fill<false>(ctx.get_stream<xpu>(), outputs[0], req[0], param.fill_value);
 }
 
 /*! \brief Fill output with an arbitrary value */
@@ -424,6 +635,29 @@ void FillComputeZerosEx(const nnvm::NodeAttrs& attrs,
   }
 }
 
+template<typename xpu>
+inline void EyeFillImpl(const TBlob& out_data,
+                        const OpContext& ctx,
+                        const std::vector<OpReqType>& req,
+                        const nnvm::dim_t num_cols,
+                        const nnvm::dim_t N,
+                        const nnvm::dim_t k) {
+  using namespace mxnet_op;
+  const nnvm::dim_t cnnz = std::max(num_cols - std::abs(k), (nnvm::dim_t)0);
+  const nnvm::dim_t rnnz = std::max(N - std::abs(k), (nnvm::dim_t)0);
+  const nnvm::dim_t nnz = k > 0 ? std::min(cnnz, N) :
+                          std::min(rnnz, num_cols);
+  mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
+  MSHADOW_TYPE_SWITCH(out_data.type_flag_, DType, {
+      MXNET_ASSIGN_REQ_SWITCH(req[0], req_type, {
+        Fill(s, out_data, req[0], static_cast<DType>(0));
+        if (nnz > 0) {
+          Kernel<eye_dns_fill<req_type>, xpu>::Launch(s, nnz, out_data.dptr<DType>(),
+            std::max(static_cast<nnvm::dim_t>(0), k), k, num_cols);
+        }
+      });
+  });
+}
 
 template<typename xpu>
 void EyeFill(const nnvm::NodeAttrs& attrs,
@@ -434,37 +668,22 @@ void EyeFill(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(inputs.size(), 0U);
   CHECK_EQ(outputs.size(), 1U);
   CHECK_EQ(req.size(), 1U);
-  mshadow::Stream<xpu> *s = ctx.get_stream<xpu>();
   const EyeParam& param = nnvm::get<EyeParam>(attrs.parsed);
   const TBlob& out_data = outputs[0];
   const nnvm::dim_t num_cols = param.M > 0 ? param.M : param.N;
-
-  const nnvm::dim_t cnnz = std::max(num_cols - std::abs(param.k), (nnvm::dim_t)0);
-  const nnvm::dim_t rnnz = std::max(param.N - std::abs(param.k), (nnvm::dim_t)0);
-  const nnvm::dim_t nnz = param.k > 0 ? std::min(cnnz, param.N) :
-                                        std::min(rnnz, num_cols);
-  using namespace mxnet_op;
-  MSHADOW_TYPE_SWITCH(out_data.type_flag_, DType, {
-    MXNET_ASSIGN_REQ_SWITCH(req[0], req_type, {
-      Fill(s, out_data, req[0], static_cast<DType>(0));
-      if (nnz > 0) {
-        Kernel<eye_dns_fill<req_type>, xpu>::Launch(s, nnz, out_data.dptr<DType>(),
-          std::max(static_cast<nnvm::dim_t>(0), param.k), param.k, num_cols);
-      }
-    });
-  });
+  EyeFillImpl<xpu>(out_data, ctx, req, num_cols, param.N, param.k);
 }
 
 
 struct range_fwd {
   template<typename DType>
-  MSHADOW_XINLINE static void Map(index_t i, int repeat, DType start, DType step,
+  MSHADOW_XINLINE static void Map(index_t i, index_t repeat, DType start, DType step,
                                   int req, DType* out) {
     KERNEL_ASSIGN(out[i], req, start + (i/repeat) * step);
   }
 };
 
-template<typename xpu>
+template<typename xpu, typename ParamType>
 void RangeCompute(const nnvm::NodeAttrs& attrs,
                   const OpContext& ctx,
                   const std::vector<TBlob>& inputs,
@@ -472,7 +691,7 @@ void RangeCompute(const nnvm::NodeAttrs& attrs,
                   const std::vector<TBlob>& outputs) {
   using namespace mxnet_op;
   Stream<xpu> *s = ctx.get_stream<xpu>();
-  const RangeParam& param = nnvm::get<RangeParam>(attrs.parsed);
+  const ParamType& param = nnvm::get<ParamType>(attrs.parsed);
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
       // Force unsigned params to take two's complement form on ARM to ensure consistency with x86
       // results.  Casting negative floats to unsigned types is undefined in the CPP standard.
@@ -513,7 +732,78 @@ inline bool RangeShape(const nnvm::NodeAttrs& attrs,
   }
   const double out_size = std::ceil((param.stop.value() - param.start) / param.step)
                           * param.repeat;
-  SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape({static_cast<nnvm::dim_t>(out_size)}));
+  mxnet::TShape output_shape = mxnet::TShape({static_cast<nnvm::dim_t>(out_size)});
+  if (!features::is_enabled(features::INT64_TENSOR_SIZE)) {
+    CHECK_LT(output_shape.Size(), (int64_t{1} << 31) - 1) <<
+              "[RangeShape] Size of tensor you are trying to allocate is larger than "
+              "2^31 elements. Please build with flag USE_INT64_TENSOR_SIZE=1";
+  }
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, output_shape);
+  return true;
+}
+
+struct linspace_fwd {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(index_t i, double start, double stop, double step,
+                                  int req, DType* out) {
+    KERNEL_ASSIGN(out[i], req, static_cast<DType>(start + step * i));
+  }
+};
+
+template<typename xpu>
+void LinspaceCompute(const nnvm::NodeAttrs& attrs,
+                     const OpContext& ctx,
+                     const std::vector<TBlob>& inputs,
+                     const std::vector<OpReqType>& req,
+                     const std::vector<TBlob>& outputs) {
+  using namespace mxnet_op;
+  Stream<xpu> *s = ctx.get_stream<xpu>();
+  const LinspaceParam& param = nnvm::get<LinspaceParam>(attrs.parsed);
+  MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+      index_t step_num = param.endpoint ? param.num - 1 : param.num;
+      double step = step_num > 0 ? (param.stop - param.start) / step_num : 0.0f;
+      Kernel<linspace_fwd, xpu>::Launch(s,
+                                        outputs[0].Size(),
+                                        param.start,
+                                        param.stop,
+                                        step,
+                                        req[0],
+                                        outputs[0].dptr<DType>());
+  });
+}
+
+inline bool LinspaceShape(const nnvm::NodeAttrs& attrs,
+                       mxnet::ShapeVector *in_attrs,
+                       mxnet::ShapeVector *out_attrs) {
+  const LinspaceParam& param = nnvm::get<LinspaceParam>(attrs.parsed);
+  CHECK_EQ(in_attrs->size(), 0U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  CHECK_GE(param.num, 0)
+    << "Number of sequence should be non-negative, received " << param.num;
+  mxnet::TShape shape = mxnet::TShape({static_cast<nnvm::dim_t>(param.num)});
+  SHAPE_ASSIGN_CHECK(*out_attrs, 0, shape);
+  return true;
+}
+
+inline bool RangeLikeShape(const nnvm::NodeAttrs& attrs,
+                           mxnet::ShapeVector *in_attrs,
+                           mxnet::ShapeVector *out_attrs) {
+  const RangeLikeParam& param = nnvm::get<RangeLikeParam>(attrs.parsed);
+  CHECK_EQ(in_attrs->size(), 1U);
+  CHECK_EQ(out_attrs->size(), 1U);
+  int real_axis = -1;
+  if (param.axis.has_value()) {
+    real_axis = param.axis.value() < 0 ?
+        (param.axis.value() + (*in_attrs)[0].ndim()) : param.axis.value();
+    CHECK(real_axis >=0 && real_axis < (*in_attrs)[0].ndim())
+        << "cannot handle param.axis " << param.axis.value() << ".";
+  }
+  if (real_axis == -1) {
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, (*in_attrs)[0]);
+  } else {
+    const index_t out_size = (*in_attrs)[0][real_axis];
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape({static_cast<nnvm::dim_t>(out_size)}));
+  }
   return true;
 }
 

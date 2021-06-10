@@ -20,10 +20,7 @@
 # pylint: disable=super-init-not-called
 
 """Text token embeddings."""
-from __future__ import absolute_import
-from __future__ import print_function
 
-import io
 import logging
 import os
 import tarfile
@@ -35,6 +32,9 @@ from . import vocab
 from ... import ndarray as nd
 from ... import registry
 from ... import base
+from ...util import is_np_array
+from ... import numpy as _mx_np
+from ... import numpy_extension as _mx_npx
 
 
 def register(embedding_cls):
@@ -254,7 +254,7 @@ class _TokenEmbedding(vocab.Vocabulary):
         tokens = set()
         loaded_unknown_vec = None
         line_num = 0
-        with io.open(pretrained_file_path, 'r', encoding=encoding) as f:
+        with open(pretrained_file_path, 'r', encoding=encoding) as f:
             for line in f:
                 line_num += 1
                 elems = line.rstrip().split(elem_delim)
@@ -295,12 +295,15 @@ class _TokenEmbedding(vocab.Vocabulary):
                     tokens.add(token)
 
         self._vec_len = vec_len
-        self._idx_to_vec = nd.array(all_elems).reshape((-1, self.vec_len))
+        array_fn = _mx_np.array if is_np_array() else nd.array
+        self._idx_to_vec = array_fn(all_elems).reshape((-1, self.vec_len))
 
         if loaded_unknown_vec is None:
-            self._idx_to_vec[C.UNKNOWN_IDX] = init_unknown_vec(shape=self.vec_len)
+            init_val = init_unknown_vec(shape=self.vec_len)
+            self._idx_to_vec[C.UNKNOWN_IDX] =\
+                init_val.as_np_ndarray() if is_np_array() else init_val
         else:
-            self._idx_to_vec[C.UNKNOWN_IDX] = nd.array(loaded_unknown_vec)
+            self._idx_to_vec[C.UNKNOWN_IDX] = array_fn(loaded_unknown_vec)
 
     def _index_tokens_from_vocabulary(self, vocabulary):
         self._token_to_idx = vocabulary.token_to_idx.copy() \
@@ -328,7 +331,8 @@ class _TokenEmbedding(vocab.Vocabulary):
         """
 
         new_vec_len = sum(embed.vec_len for embed in token_embeddings)
-        new_idx_to_vec = nd.zeros(shape=(vocab_len, new_vec_len))
+        zeros_fn = _mx_np.zeros if is_np_array() else nd.zeros
+        new_idx_to_vec = zeros_fn(shape=(vocab_len, new_vec_len))
 
         col_start = 0
         # Concatenate all the embedding vectors in token_embeddings.
@@ -397,7 +401,13 @@ class _TokenEmbedding(vocab.Vocabulary):
                        else self.token_to_idx.get(token.lower(), C.UNKNOWN_IDX)
                        for token in tokens]
 
-        vecs = nd.Embedding(nd.array(indices), self.idx_to_vec, self.idx_to_vec.shape[0],
+        if is_np_array():
+            embedding_fn = _mx_npx.embedding
+            array_fn = _mx_np.array
+        else:
+            embedding_fn = nd.Embedding
+            array_fn = nd.array
+        vecs = embedding_fn(array_fn(indices), self.idx_to_vec, self.idx_to_vec.shape[0],
                             self.idx_to_vec.shape[1])
 
         return vecs[0] if to_reduce else vecs
@@ -425,7 +435,8 @@ class _TokenEmbedding(vocab.Vocabulary):
             if not isinstance(tokens, list):
                 tokens = [tokens]
             if len(new_vectors.shape) == 1:
-                new_vectors = new_vectors.expand_dims(0)
+                expand_dims_fn = _mx_np.expand_dims if is_np_array() else nd.expand_dims
+                new_vectors = expand_dims_fn(new_vectors, axis=0)
 
         else:
             assert isinstance(new_vectors, nd.NDArray) and len(new_vectors.shape) == 2, \
@@ -444,7 +455,8 @@ class _TokenEmbedding(vocab.Vocabulary):
                                  '`unknown_token` %s in `tokens`. This is to avoid unintended '
                                  'updates.' % (token, self.idx_to_token[C.UNKNOWN_IDX]))
 
-        self._idx_to_vec[nd.array(indices)] = new_vectors
+        array_fn = _mx_np.array if is_np_array() else nd.array
+        self._idx_to_vec[array_fn(indices)] = new_vectors
 
     @classmethod
     def _check_pretrained_file_names(cls, pretrained_file_name):
@@ -573,7 +585,7 @@ class FastText(_TokenEmbedding):
     https://fasttext.cc/
 
     To get the updated URLs to the externally hosted pre-trained token embedding files, visit
-    https://github.com/facebookresearch/fastText/blob/master/pretrained-vectors.md
+    https://github.com/facebookresearch/fastText/blob/master/docs/pretrained-vectors.md
 
     License for pre-trained embeddings:
 

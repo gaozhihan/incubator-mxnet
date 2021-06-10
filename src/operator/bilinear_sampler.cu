@@ -26,10 +26,10 @@
 
 #include "./bilinear_sampler-inl.h"
 #include <algorithm>
-#include "../common/cuda_utils.h"
-#if MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 5
+#include "../common/cuda/utils.h"
+#if MXNET_USE_CUDNN == 1
 #include "./cudnn_bilinear_sampler-inl.h"
-#endif  // MXNET_USE_CUDNN && CUDNN_MAJOR
+#endif  // MXNET_USE_CUDNN
 
 namespace mshadow {
 namespace cuda {
@@ -178,7 +178,7 @@ inline void BilinearSamplerForward(const Tensor<gpu, 4, DType> &output,
     cuda::BilinearSamplerForwardKernel<DType> << <num_blocks, threads_per_block, 0, stream >> >(
       i_c, i_h, i_w, data, grid, o_n, o_c, o_h, o_w, out);
     // post kernel check
-    cudaError err = cudaPeekAtLastError();
+    cudaError err = cudaGetLastError();
     CHECK_EQ(err, cudaSuccess) << cudaGetErrorString(err);
 }
 
@@ -217,7 +217,7 @@ inline void BilinearSamplerBackward(const Tensor<gpu, 4, DType> &input_grad,
     });
   });
   // post kernel check
-  cudaError err = cudaPeekAtLastError();
+  cudaError err = cudaGetLastError();
   CHECK_EQ(err, cudaSuccess) << cudaGetErrorString(err);
 }
 
@@ -227,8 +227,8 @@ namespace mxnet {
 namespace op {
 template<>
 Operator* CreateOp<gpu>(BilinearSamplerParam param, int dtype) {
-  Operator *op = NULL;
-#if MXNET_USE_CUDNN == 1 && CUDNN_MAJOR >= 5
+  Operator *op = nullptr;
+#if MXNET_USE_CUDNN == 1
   MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
     if (param.cudnn_off.has_value() && param.cudnn_off.value()) {
       op = new BilinearSamplerOp<gpu, DType>(param);
@@ -240,7 +240,7 @@ Operator* CreateOp<gpu>(BilinearSamplerParam param, int dtype) {
   MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
     op = new BilinearSamplerOp<gpu, DType>(param);
   })
-#endif  // MXNET_USE_CUDNN && CUDNN_MAJOR
+#endif  // MXNET_USE_CUDNN
   return op;
 }
 

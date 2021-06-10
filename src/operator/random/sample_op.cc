@@ -138,6 +138,7 @@ Example::
 
 MXNET_OPERATOR_REGISTER_SAMPLE(_random_poisson, SamplePoissonParam)
 .add_alias("random_poisson")
+.add_alias("_npx_scalar_poisson")
 .describe(R"code(Draw random samples from a Poisson distribution.
 
 Samples are distributed according to a Poisson distribution parametrized by *lambda* (rate).
@@ -180,6 +181,7 @@ Example::
 
 MXNET_OPERATOR_REGISTER_SAMPLE(_random_randint, SampleRandIntParam)
 .add_alias("random_randint")
+.add_alias("_npi_random_randint")
 .describe(R"code(Draw random samples from a discrete uniform distribution.
 
 Samples are uniformly distributed over the half-open interval *[low, high)*

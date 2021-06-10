@@ -26,14 +26,14 @@
 
 #ifndef MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_FC_POST_QUANTIZE_PROPERTY_H_
 #define MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_FC_POST_QUANTIZE_PROPERTY_H_
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 
 #include <string>
 #include <vector>
 #include "../../nn/fully_connected-inl.h"
 #include "../../quantization/requantize-inl.h"
 #include "../common.h"
-#include "../subgraph_property.h"
+#include "mkldnn_subgraph_base-inl.h"
 
 namespace mxnet {
 namespace op {
@@ -132,13 +132,20 @@ class SgMKLDNNFCPostQuantizeSelector : public SubgraphSelector {
       return ret;
     }
   }
+
+  void Reset() override {
+    CHECK_GE(matched_list.size(), 1);
+    auto new_selector = SgMKLDNNFCPostQuantizeSelector(disable_all, disable_float_output);
+    new_selector.Select(*matched_list[0]);
+    *this = new_selector;
+  }
 };
 
 class SgMKLDNNFCPostQuantizeProperty : public SubgraphProperty {
  public:
   SgMKLDNNFCPostQuantizeProperty() {
-    disable_fuse_all = dmlc::GetEnv("MXNET_DISABLE_MKLDNN_QFC_FUSE_ALL", false);
-    disable_float_output = dmlc::GetEnv("MXNET_DISABLE_MKLDNN_QFC_FLOAT_OUTPUT", false);
+    disable_fuse_all = dmlc::GetEnv("MXNET_DISABLE_ONEDNN_QFC_FUSE_ALL", false);
+    disable_float_output = dmlc::GetEnv("MXNET_DISABLE_ONEDNN_QFC_FLOAT_OUTPUT", false);
   }
 
   static SubgraphPropertyPtr Create() {
@@ -149,13 +156,13 @@ class SgMKLDNNFCPostQuantizeProperty : public SubgraphProperty {
     return property;
   }
 
-  nnvm::NodePtr CreateSubgraphNode(const nnvm::Symbol &sym,
+  nnvm::ObjectPtr CreateSubgraphNode(const nnvm::Symbol &sym,
                                    const int subgraph_id = 0) const override {
-    nnvm::NodePtr fc_node = nullptr;
-    nnvm::NodePtr requantize_node = nullptr;
-    nnvm::NodePtr dequantize_node = nullptr;
+    nnvm::ObjectPtr fc_node = nullptr;
+    nnvm::ObjectPtr requantize_node = nullptr;
+    nnvm::ObjectPtr dequantize_node = nullptr;
 
-    DFSVisit(sym.outputs, [&](const nnvm::NodePtr &node) {
+    DFSVisit(sym.outputs, [&](const nnvm::ObjectPtr &node) {
       if (node->is_variable()) return;
       if (node->op() == Op::Get(QUANTIZED_FC_NAME)) {
         fc_node = node;
@@ -195,7 +202,7 @@ class SgMKLDNNFCPostQuantizeProperty : public SubgraphProperty {
   }
 
   void ConnectSubgraphOutputs(
-      const nnvm::NodePtr n,
+      const nnvm::ObjectPtr n,
       std::vector<nnvm::NodeEntry *> *output_entries) const override {
     for (size_t i = 0; i < output_entries->size(); ++i) {
       auto entry_ptr = output_entries->at(i);
@@ -211,5 +218,5 @@ class SgMKLDNNFCPostQuantizeProperty : public SubgraphProperty {
 }  // namespace op
 }  // namespace mxnet
 
-#endif  // if MXNET_USE_MKLDNN == 1
+#endif  // if MXNET_USE_ONEDNN == 1
 #endif  // MXNET_OPERATOR_SUBGRAPH_MKLDNN_MKLDNN_FC_POST_QUANTIZE_PROPERTY_H_

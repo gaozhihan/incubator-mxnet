@@ -22,17 +22,20 @@
  * \file threaded_engine_test.cc
  * \brief threaded engine tests
 */
-#include <time.h>
 #include <dmlc/logging.h>
 #include <dmlc/thread_group.h>
 #include <dmlc/omp.h>
 #include <gtest/gtest.h>
+#include <mxnet/c_api.h>
 #include <mxnet/engine.h>
+#include <mxnet/ndarray.h>
 #include <dmlc/timer.h>
+#include <ctime>
 #include <cstdio>
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <random>
 
 #include "../src/engine/engine_impl.h"
 #include "../include/test_util.h"
@@ -41,7 +44,7 @@
  * present the following workload
  *  n = reads.size()
  *  data[write] = (data[reads[0]] + ... data[reads[n]]) / n
- *  std::this_thread::sleep_for(std::chrono::microsecons(time));
+ *  std::this_thread::sleep_for(std::chrono::microseconds(time));
  */
 struct Workload {
   std::vector<int> reads;
@@ -60,22 +63,25 @@ void GenerateWorkload(int num_workloads, int num_var,
                       std::vector<Workload>* workloads) {
   workloads->clear();
   workloads->resize(num_workloads);
+  static thread_local std::mt19937 generator;
+  std::uniform_int_distribution<int> distribution_var(0, num_var - 1);
+  std::uniform_int_distribution<int> distribution_time(min_time, max_time - 1);
+  std::uniform_int_distribution<int> distribution_read(min_read, max_read - 1);
   for (int i = 0; i < num_workloads; ++i) {
     auto& wl = workloads->at(i);
-    wl.write = rand_r(&seed_) % num_var;
-    int r = rand_r(&seed_);
-    int num_read = min_read + (r % (max_read - min_read));
+    wl.write = distribution_var(generator);
+    int num_read = distribution_read(generator);
     for (int j = 0; j < num_read; ++j) {
-      wl.reads.push_back(rand_r(&seed_) % num_var);
+      wl.reads.push_back(distribution_var(generator));
     }
-    wl.time = min_time + rand_r(&seed_) % (max_time - min_time);
+    wl.time = distribution_time(generator);
   }
 }
 
 /**
  * evaluate a single workload
  */
-void EvaluateWorload(const Workload& wl, std::vector<double>* data) {
+void EvaluateWorkload(const Workload& wl, std::vector<double>* data) {
   double tmp = 0;
   for (int i : wl.reads) tmp += data->at(i);
   data->at(wl.write) = tmp / (wl.reads.size() + 1);
@@ -87,9 +93,9 @@ void EvaluateWorload(const Workload& wl, std::vector<double>* data) {
 /**
  * evaluate a list of workload, return the time used
  */
-double EvaluateWorloads(const std::vector<Workload>& workloads,
-                      mxnet::Engine* engine,
-                      std::vector<double>* data) {
+double EvaluateWorkloads(const std::vector<Workload>& workloads,
+                         mxnet::Engine* engine,
+                         std::vector<double>* data) {
   using namespace mxnet;
   double t = dmlc::GetTime();
   std::vector<Engine::VarHandle> vars;
@@ -101,11 +107,11 @@ double EvaluateWorloads(const std::vector<Workload>& workloads,
 
   for (const auto& wl : workloads) {
     if (wl.reads.size() == 0) continue;
-    if (engine == NULL) {
-      EvaluateWorload(wl, data);
+    if (engine == nullptr) {
+      EvaluateWorkload(wl, data);
     } else {
       auto func = [wl, data](RunContext ctx, Engine::CallbackOnComplete cb) {
-        EvaluateWorload(wl, data); cb();
+        EvaluateWorkload(wl, data); cb();
       };
       std::vector<Engine::VarHandle> reads;
       for (auto i : wl.reads) {
@@ -146,19 +152,19 @@ TEST(Engine, RandSumExpr) {
   std::vector<double> t(num_engine, 0.0);
   std::vector<mxnet::Engine*> engine(num_engine);
 
-  engine[0] = NULL;
+  engine[0] = nullptr;
   engine[1] = mxnet::engine::CreateNaiveEngine();
   engine[2] = mxnet::engine::CreateThreadedEnginePooled();
   engine[3] = mxnet::engine::CreateThreadedEnginePerDevice();
 
   for (int repeat = 0; repeat < num_repeat; ++repeat) {
-    srand(time(NULL) + repeat);
+    srand(time(nullptr) + repeat);
     int num_var = 100;
     GenerateWorkload(10000, num_var, 2, 20, 1, 10, &workloads);
     std::vector<std::vector<double>> data(num_engine);
     for (int i = 0; i < num_engine; ++i) {
       data[i].resize(num_var, 1.0);
-      t[i] += EvaluateWorloads(workloads, engine[i], &data[i]);
+      t[i] += EvaluateWorkloads(workloads, engine[i], &data[i]);
     }
 
     for (int i = 1; i < num_engine; ++i) {
@@ -175,6 +181,161 @@ TEST(Engine, RandSumExpr) {
 }
 
 void Foo(mxnet::RunContext, int i) { printf("The fox says %d\n", i); }
+
+void FooAsyncFunc(void*, void* cb_ptr, void* param) {
+  if (param == nullptr) {
+    LOG(INFO) << "The fox asynchronously says receiving nothing.";
+  } else {
+    auto num = static_cast<int*>(param);
+    EXPECT_EQ(*num, 100);
+    LOG(INFO) << "The fox asynchronously says receiving " << *num;
+  }
+  auto cb = *static_cast<mxnet::engine::CallbackOnComplete*>(cb_ptr);
+  cb();
+}
+
+void FooSyncFunc(void*, void* param) {
+  if (param == nullptr) {
+    LOG(INFO) << "The fox synchronously says receiving nothing.";
+  } else {
+    auto num = static_cast<int*>(param);
+    EXPECT_EQ(*num, 101);
+    LOG(INFO) << "The fox synchronously says receiving " << *num;
+  }
+}
+
+void FooFuncDeleter(void* param) {
+  if (param != nullptr) {
+    auto num = static_cast<int*>(param);
+    LOG(INFO) << "The fox says deleting " << *num;
+    delete num;
+  }
+}
+
+TEST(Engine, PushFunc) {
+  auto var = mxnet::Engine::Get()->NewVariable();
+  auto ctx = mxnet::Context{};
+
+  // Test #1
+  LOG(INFO) << "===== Test #1: PushAsync param and deleter =====";
+  int* a = new int(100);
+  int res = MXEnginePushAsync(FooAsyncFunc, a, FooFuncDeleter, &ctx, &var, 1, nullptr, 0);
+  EXPECT_EQ(res, 0);
+
+  // Test #2
+  LOG(INFO) << "===== Test #2: PushAsync NULL param and NULL deleter =====";
+  res = MXEnginePushAsync(FooAsyncFunc, nullptr, nullptr, &ctx, nullptr, 0, &var, 0);
+  EXPECT_EQ(res, 0);
+
+  // Test #3
+  LOG(INFO) << "===== Test #3: PushAsync invalid number of const vars =====";
+  res = MXEnginePushAsync(FooAsyncFunc, nullptr, nullptr, &ctx, &var, -1, nullptr, 0);
+  EXPECT_EQ(res, -1);
+
+  // Test #4
+  LOG(INFO) << "===== Test #4: PushAsync invalid number of mutable vars =====";
+  res = MXEnginePushAsync(FooAsyncFunc, nullptr, nullptr, &ctx, nullptr, 0, &var, -1);
+  EXPECT_EQ(res, -1);
+
+  // Test #5
+  LOG(INFO) << "===== Test #5: PushSync param and deleter =====";
+  int* b = new int(101);
+  res = MXEnginePushSync(FooSyncFunc, b, FooFuncDeleter, &ctx, &var, 1, nullptr, 0);
+  EXPECT_EQ(res, 0);
+
+  // Test #6
+  LOG(INFO) << "===== Test #6: PushSync NULL param and NULL deleter =====";
+  res = MXEnginePushSync(FooSyncFunc, nullptr, nullptr, &ctx, nullptr, 0, &var, 1);
+  EXPECT_EQ(res, 0);
+
+  // Test #7
+  LOG(INFO) << "===== Test #7: PushSync invalid number of const vars =====";
+  res = MXEnginePushSync(FooSyncFunc, nullptr, nullptr, &ctx, &var, -1, nullptr, 0);
+  EXPECT_EQ(res, -1);
+
+  // Test #8
+  LOG(INFO) << "===== Test #8: PushSync invalid number of mutable vars =====";
+  res = MXEnginePushSync(FooSyncFunc, nullptr, nullptr, &ctx, nullptr, 0, &var, -1);
+  EXPECT_EQ(res, -1);
+}
+
+TEST(Engine, PushFuncND) {
+  auto ctx = mxnet::Context{};
+  std::vector<mxnet::NDArray*> nds;
+  const int num_nds = 5;
+  for (int i = 0; i < num_nds; ++i) {
+      mxnet::NDArray *pnd = new mxnet::NDArray(ctx);
+      nds.push_back(pnd);
+  }
+  for (int num_const_nds = 0; num_const_nds <= num_nds; ++num_const_nds) {
+      int num_mutable_nds = num_nds - num_const_nds;
+      void** const_nds_handle = num_const_nds > 0 ?
+          reinterpret_cast<void**>(nds.data()) : nullptr;
+      void** mutable_nds_handle = num_mutable_nds > 0 ?
+          reinterpret_cast<void**>(nds.data() + num_const_nds) : nullptr;
+
+      // Test #1
+      LOG(INFO) << "===== Test #1: PushAsyncND param and deleter =====";
+      int* a = new int(100);
+      int res = MXEnginePushAsyncND(FooAsyncFunc, a, FooFuncDeleter, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, 0);
+
+      // Test #2
+      LOG(INFO) << "===== Test #2: PushAsyncND NULL param and NULL deleter =====";
+      res = MXEnginePushAsyncND(FooAsyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, 0);
+
+      // Test #3
+      LOG(INFO) << "===== Test #3: PushAsyncND invalid number of const nds =====";
+      res = MXEnginePushAsyncND(FooAsyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, -1,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, -1);
+
+      // Test #4
+      LOG(INFO) << "===== Test #4: PushAsyncND invalid number of mutable nds =====";
+      res = MXEnginePushAsyncND(FooAsyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, -1);
+      EXPECT_EQ(res, -1);
+
+      // Test #5
+      LOG(INFO) << "===== Test #5: PushSyncND param and deleter =====";
+      int* b = new int(101);
+      res = MXEnginePushSyncND(FooSyncFunc, b, FooFuncDeleter, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, 0);
+
+      // Test #6
+      LOG(INFO) << "===== Test #6: PushSyncND NULL param and NULL deleter =====";
+      res = MXEnginePushSyncND(FooSyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, 0);
+
+      // Test #7
+      LOG(INFO) << "===== Test #7: PushSyncND invalid number of const nds =====";
+      res = MXEnginePushSyncND(FooSyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, -1,
+              mutable_nds_handle, num_mutable_nds);
+      EXPECT_EQ(res, -1);
+
+      // Test #8
+      LOG(INFO) << "===== Test #8: PushSyncND invalid number of mutable nds =====";
+      res = MXEnginePushSyncND(FooSyncFunc, nullptr, nullptr, &ctx,
+              const_nds_handle, num_const_nds,
+              mutable_nds_handle, -1);
+      EXPECT_EQ(res, -1);
+  }
+  for (mxnet::NDArray* pnd : nds) {
+      delete pnd;
+  }
+}
 
 TEST(Engine, basics) {
   auto&& engine = mxnet::Engine::Get();

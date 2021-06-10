@@ -28,14 +28,19 @@ namespace op {
 
 struct index_copy_fwd_cpu {
   template<typename DType, typename IType>
-  static void Map(int i,
+  static void Map(index_t i,
                   const DType* new_tensor,
                   const IType* idx,
                   DType* out_tensor,
                   int dim_size) {
-    DType* out_ptr = out_tensor + static_cast<int>(idx[i]) * dim_size;
+    DType* out_ptr = out_tensor + static_cast<index_t>(idx[i]) * dim_size;
     const DType* new_ptr = new_tensor + i * dim_size;
+#pragma GCC diagnostic push
+#if __GNUC__ >= 8
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
     std::memcpy(out_ptr, new_ptr, sizeof(DType) * dim_size);
+#pragma GCC diagnostic pop
   }
 };
 
@@ -95,7 +100,12 @@ struct index_copy_bwd_cpu {
     } else if (orig_req == kNullOp) {
       return;
     } else {
+#pragma GCC diagnostic push
+#if __GNUC__ >= 8
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
       std::memset(orig_ptr, 0, sizeof(DType) * dim_size);
+#pragma GCC diagnostic pop
     }
   }
 };

@@ -37,6 +37,7 @@
 #include "./comm_tree.h"
 #include "./kvstore_utils.h"
 #include "../ndarray/ndarray_function.h"
+#include "../profiler/profiler.h"
 
 namespace mxnet {
 namespace kvstore {
@@ -129,6 +130,24 @@ class KVStoreLocal : public KVStore {
     PullImpl(keys, values, priority, ignore_sparse);
   }
 
+  void Broadcast(const std::vector<int>& vkeys,
+                 const std::vector<int>& okeys,
+                 const std::vector<NDArray>& values,
+                 const std::vector<NDArray*>& outs,
+                 int priority) override {
+    SetKeyType(kIntKey);
+    BroadcastImpl(vkeys, okeys, values, outs, priority);
+  }
+
+  void PushPull(const std::vector<int>& vkeys,
+                const std::vector<int>& okeys,
+                const std::vector<NDArray>& values,
+                const std::vector<NDArray*>& outs,
+                int priority) override {
+    SetKeyType(kIntKey);
+    PushPullImpl(vkeys, okeys, values, outs, priority);
+  }
+
   void PullRowSparse(const std::vector<int>& keys,
                      const std::vector<std::pair<NDArray*, NDArray>>& val_rowids,
                      int priority = 0) override {
@@ -155,6 +174,41 @@ class KVStoreLocal : public KVStore {
     PullImpl(keys, values, priority, ignore_sparse);
   }
 
+  void Broadcast(const std::vector<std::string>& str_vkeys,
+                 const std::vector<std::string>& str_okeys,
+                 const std::vector<NDArray>& values,
+                 const std::vector<NDArray*>& outs,
+                 int priority) override {
+    SetKeyType(kStringKey);
+    std::vector<int> vkeys(str_vkeys.size());
+    std::vector<int> okeys(str_okeys.size());
+    for (size_t i = 0; i < str_vkeys.size(); ++i) {
+      auto &str_key = str_vkeys[i];
+      CHECK(str_key_dict_.find(str_key) == str_key_dict_.end())
+            << "duplicate init of key " << str_key;
+      auto key = next_str_key_++;
+      str_key_dict_[str_key] = key;
+      // record reverse mapping from int to string
+      reverse_str_key_dict_[key] = str_key;
+      vkeys[i] = key;
+    }
+    LookupKeys(str_okeys, &okeys);
+    BroadcastImpl(vkeys, okeys, values, outs, priority);
+  }
+
+  void PushPull(const std::vector<std::string>& str_vkeys,
+                const std::vector<std::string>& str_okeys,
+                const std::vector<NDArray>& values,
+                const std::vector<NDArray*>& outs,
+                int priority) override {
+    SetKeyType(kStringKey);
+    std::vector<int> vkeys(str_vkeys.size());
+    std::vector<int> okeys(str_okeys.size());
+    LookupKeys(str_vkeys, &vkeys);
+    LookupKeys(str_okeys, &okeys);
+    PushPullImpl(vkeys, okeys, values, outs, priority);
+  }
+
   void PullRowSparse(const std::vector<std::string>& str_keys,
                      const std::vector<std::pair<NDArray*, NDArray>>& val_rowids,
                      int priority = 0) override {
@@ -174,7 +228,9 @@ class KVStoreLocal : public KVStore {
                         const std::vector<NDArray>& values) {
     for (size_t i = 0; i < keys.size(); ++i) {
       CHECK(local_.find(keys[i]) == local_.end())
-          << "duplicate init of key " << keys[i];
+          << "duplicate init of key " << keys[i]
+          << ". Please double check if you called kv.init or kv.broadcast with this key "
+          << "multiple times";
       local_[keys[i]] = values[i].Copy(pinned_ctx_);
       comm_->Init(keys[i], values[i].storage_type(), values[i].shape(), values[i].dtype());
     }
@@ -191,6 +247,15 @@ class KVStoreLocal : public KVStore {
       int key = uniq_keys[i];
       const NDArray& merged = comm_->Reduce(key, grouped_vals[i], priority);
       NDArray& local = local_[key];
+      if (key_type_ == kStringKey) {
+        local.AssignStorageInfo(
+            profiler::ProfilerScope::Get()->GetCurrentProfilerScope() + "kvstore:push:",
+            reverse_str_key_dict_[key]);
+      } else {
+        local.AssignStorageInfo(
+            profiler::ProfilerScope::Get()->GetCurrentProfilerScope() + "kvstore:push:",
+            "local_" + std::to_string(key));
+      }
       if (updater_ != nullptr) {
         CHECK(!local.is_none()) << "key " << key << " has not been inited";
         // if merged is on gpu, we may need copy weight from cpu to gpu
@@ -233,6 +298,18 @@ class KVStoreLocal : public KVStore {
       const NDArray& local = local_[key];
       CHECK(!local.is_none()) << "key " << key << " has not been inited";
       comm_->Broadcast(key, local, grouped_vals[i], priority);
+      for (std::vector<NDArray*>::iterator iter = grouped_vals[i].begin();
+           iter != grouped_vals[i].end(); ++iter) {
+        if (key_type_ == kStringKey) {
+          (*iter)->AssignStorageInfo(
+              profiler::ProfilerScope::Get()->GetCurrentProfilerScope() + "kvstore:pull:",
+              reverse_str_key_dict_[key]);
+        } else {
+          (*iter)->AssignStorageInfo(
+              profiler::ProfilerScope::Get()->GetCurrentProfilerScope() + "kvstore:pull:",
+              "grouped_vals_" + std::to_string(key));
+        }
+      }
     }
   }
 
@@ -269,6 +346,24 @@ class KVStoreLocal : public KVStore {
     CHECK_EQ(key_type_, key_type) << "Mixed key types are not allowed";
   }
 
+  virtual void BroadcastImpl(const std::vector<int>& vkeys,
+                             const std::vector<int>& okeys,
+                             const std::vector<NDArray>& values,
+                             const std::vector<NDArray*>& outs,
+                             int priority) {
+    InitImpl(vkeys, values);
+    PullImpl(okeys, outs, priority, true);
+  }
+
+  virtual void PushPullImpl(const std::vector<int>& vkeys,
+                            const std::vector<int>& okeys,
+                            const std::vector<NDArray>& values,
+                            const std::vector<NDArray*>& outs,
+                            int priority) {
+    PushImpl(vkeys, values, priority);
+    PullImpl(okeys, outs, priority, true);
+  }
+
   /**
    * \brief group values on keys for push
    */
@@ -278,7 +373,7 @@ class KVStoreLocal : public KVStore {
                                 std::vector<std::vector<NDArray>> *grouped_vals,
                                 bool ignore_sparse) {
     // check if the storage type of a value is valid
-    auto validator = [this](const int key, const NDArray& nd, bool ignore_sparse) -> bool {
+    auto validator = [](const int key, const NDArray& nd, bool ignore_sparse) -> bool {
       CHECK(!ignore_sparse) << "Cannot ignore sparse arrays for push";
       auto stype = nd.storage_type();
       // valid NDArray
@@ -323,7 +418,7 @@ class KVStoreLocal : public KVStore {
                                    std::vector<std::vector<RSPVal>> *grouped_vals,
                                    bool ignore_sparse) {
     // check if the storage type of a value is valid
-    auto validator = [this](const int key, const RSPVal& val_rowid, bool ignore_sparse) -> bool {
+    auto validator = [](const int key, const RSPVal& val_rowid, bool ignore_sparse) -> bool {
       CHECK(!ignore_sparse) << "Cannot ignore sparse arrays in row_sparse_pull";
       auto val_stype = val_rowid.first->storage_type();
       auto rowid_stype = val_rowid.second.storage_type();

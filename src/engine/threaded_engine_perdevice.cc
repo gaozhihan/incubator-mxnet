@@ -28,6 +28,9 @@
 #include <dmlc/parameter.h>
 #include <dmlc/concurrency.h>
 #include <dmlc/thread_group.h>
+
+#include <memory>
+#include "../initialize.h"
 #include "./threaded_engine.h"
 #include "./thread_pool.h"
 #include "../common/lazy_alloc_array.h"
@@ -54,7 +57,7 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
   ThreadedEnginePerDevice() noexcept(false) {
     this->Start();
   }
-  ~ThreadedEnginePerDevice() noexcept(false) {
+  ~ThreadedEnginePerDevice() noexcept(false) override {
     this->StopNoWait();
   }
 
@@ -76,16 +79,17 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
   void Start() override {
     if (is_worker_) return;
     gpu_worker_nthreads_ = common::GetNumThreadsPerGPU();
-    cpu_worker_nthreads_ = dmlc::GetEnv("MXNET_CPU_WORKER_NTHREADS", 1);
+    // MXNET_CPU_WORKER_NTHREADS
+    cpu_worker_nthreads_ = LibraryInitializer::Get()->cpu_worker_nthreads_;
     gpu_copy_nthreads_ = dmlc::GetEnv("MXNET_GPU_COPY_NTHREADS", 2);
     // create CPU task
     int cpu_priority_nthreads = dmlc::GetEnv("MXNET_CPU_PRIORITY_NTHREADS", 4);
-    cpu_priority_worker_.reset(new ThreadWorkerBlock<kPriorityQueue>());
-    cpu_priority_worker_->pool.reset(new ThreadPool(
+    cpu_priority_worker_ = std::make_unique<ThreadWorkerBlock<kPriorityQueue>>();
+    cpu_priority_worker_->pool = std::make_unique<ThreadPool>(
         cpu_priority_nthreads,
         [this](std::shared_ptr<dmlc::ManualEvent> ready_event) {
           this->CPUWorker(Context(), cpu_priority_worker_.get(), ready_event);
-        }, true));
+        }, true);
     // GPU tasks will be created lazily
   }
 
@@ -111,10 +115,10 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
           auto ptr =
           cpu_normal_workers_.Get(dev_id, [this, ctx, nthread]() {
               auto blk = new ThreadWorkerBlock<kWorkerQueue>();
-              blk->pool.reset(new ThreadPool(nthread,
+              blk->pool = std::make_unique<ThreadPool>(nthread,
                   [this, ctx, blk](std::shared_ptr<dmlc::ManualEvent> ready_event) {
                     this->CPUWorker(ctx, blk, ready_event);
-                  }, true));
+                  }, true);
             return blk;
           });
           if (ptr) {
@@ -137,12 +141,12 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
             // Signify to kernel that GPU is being used, so reserve cores as necessary
             OpenMP::Get()->set_reserve_cores(GetReserveCoreCount(true));
             auto blk = new ThreadWorkerBlock<kCopyQueue>();
-              blk->pool.reset(new ThreadPool(
+              blk->pool = std::make_unique<ThreadPool>(
                 nthread,
                 [this, ctx, is_copy, blk]
                   (std::shared_ptr<dmlc::ManualEvent> ready_event) {
                     this->GPUWorker(ctx, is_copy, blk, ready_event);
-                  }, true));
+                  }, true);
               return blk;
             });
           if (ptr) {
@@ -160,12 +164,12 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
               // Signify to kernel that GPU is being used, so reserve cores as necessary
               OpenMP::Get()->set_reserve_cores(GetReserveCoreCount(true));
                 auto blk = new ThreadWorkerBlock<kPriorityQueue>();
-                blk->pool.reset(new ThreadPool(
+                blk->pool = std::make_unique<ThreadPool>(
                   nthread,
                   [this, ctx, is_copy, blk]
                     (std::shared_ptr<dmlc::ManualEvent> ready_event) {
                       this->GPUWorker(ctx, is_copy, blk, ready_event);
-                    }, true));
+                    }, true);
                 return blk;
             });
             if (ptr) {
@@ -177,12 +181,12 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
               // Signify to kernel that GPU is being used, so reserve cores as necessary
               OpenMP::Get()->set_reserve_cores(GetReserveCoreCount(true));
                 auto blk = new ThreadWorkerBlock<kWorkerQueue>();
-                blk->pool.reset(new ThreadPool(
+                blk->pool = std::make_unique<ThreadPool>(
                   nthread,
                   [this, ctx, is_copy, blk]
                     (std::shared_ptr<dmlc::ManualEvent> ready_event) {
                       this->GPUWorker(ctx, is_copy, blk, ready_event);
-                    }, true));
+                    }, true);
                 return blk;
             });
             if (ptr) {
@@ -209,7 +213,7 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
     // constructor
     ThreadWorkerBlock() = default;
     // destructor
-    ~ThreadWorkerBlock() noexcept(false) {}
+    ~ThreadWorkerBlock() = default;
   };
 
   /*! \brief whether this is a worker thread. */
@@ -269,10 +273,6 @@ class ThreadedEnginePerDevice : public ThreadedEngine {
     while (task_queue->Pop(&opr_block)) {
       this->ExecuteOprBlock(run_ctx, opr_block);
     }
-    // Catch exception for CUDA driver shutdown
-    MSHADOW_CATCH_ERROR(mshadow::DeleteStream<gpu>(stream));
-    if (aux_stream != nullptr)
-      delete aux_stream;
 #else
     ready_event->signal();
 #endif

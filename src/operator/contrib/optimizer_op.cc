@@ -45,7 +45,7 @@ inline bool GroupAdagradShape(const nnvm::NodeAttrs &attrs,
   SHAPE_ASSIGN_CHECK(*in_attrs, 0, out_attrs->at(0));
   SHAPE_ASSIGN_CHECK(*in_attrs, 1, out_attrs->at(0));
 
-  return out_attrs->at(0).ndim() != 0U && out_attrs->at(0).Size() != 0U &&
+  return !mxnet::op::shape_is_none(out_attrs->at(0)) &&
          (in_attrs->at(0)[0] == in_attrs->at(1)[0]) &&
          (in_attrs->at(0)[0] == in_attrs->at(2)[0]);
 }
@@ -61,7 +61,7 @@ Updates are applied by::
 
     grad = clip(grad * rescale_grad, clip_gradient)
     history += mean(square(grad), axis=1, keepdims=True)
-    div = grad / sqrt(history + float_stable_eps)
+    div = grad / (sqrt(history) + epsilon)
     weight -= div * lr
 
 Weights are updated lazily if the gradient is sparse.

@@ -26,8 +26,8 @@
 #ifndef MXNET_STORAGE_STORAGE_MANAGER_H_
 #define MXNET_STORAGE_STORAGE_MANAGER_H_
 
+#include "./storage_manager_helpers.h"
 #include <mxnet/storage.h>
-#include <cstddef>
 
 namespace mxnet {
 namespace storage {
@@ -52,6 +52,14 @@ class StorageManager {
    * \param handle Handle struct.
    */
   virtual void DirectFree(Storage::Handle handle) = 0;
+  /*!
+  * \brief Release all memory if using a pool storage manager
+  *
+  * This release all memory from pool storage managers such as
+  * GPUPooledStorageManager and GPUPooledRoundedStorageManager.
+  * For non-pool memory managers this has no effect.
+  */
+  virtual void ReleaseAll() {}
   /*!
    * \brief Destructor.
    */

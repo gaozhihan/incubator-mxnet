@@ -124,7 +124,8 @@ class OperatorTune : public OperatorTuneByType<DType> {
     if (!initialized_) {
       initialized_ = true;
       // Generate some random data for calling the operator kernels
-      data_set_.reserve(0x100);
+      data_set_ =
+        std::unique_ptr<DType[]>(reinterpret_cast<DType*>(new char[0x100 * sizeof(DType)]));
       std::random_device rd;
       std::mt19937 gen(rd());
       if (!std::is_integral<DType>::value) {
@@ -136,7 +137,7 @@ class OperatorTune : public OperatorTuneByType<DType> {
             --n;
             continue;
           }
-          data_set_.emplace_back(val);
+          data_set_[n] = val;
         }
       } else {
         std::uniform_int_distribution<> dis(-128, 127);
@@ -147,7 +148,7 @@ class OperatorTune : public OperatorTuneByType<DType> {
             --n;
             continue;
           }
-          data_set_.emplace_back(val);
+          data_set_[n] = val;
         }
       }
       // Use this environment variable to generate new tuning statistics
@@ -430,6 +431,8 @@ class OperatorTune : public OperatorTuneByType<DType> {
       return mshadow::kFloat64;
     if (type_string == "float16")
       return mshadow::kFloat16;
+    if (type_string == "bfloat16")
+      return mshadow::kBfloat16;
     if (type_string == "int8")
       return mshadow::kInt8;
     if (type_string == "uint8")
@@ -517,7 +520,7 @@ class OperatorTune : public OperatorTuneByType<DType> {
   /*! \brief Number of passes to obtain an average */
   static constexpr duration_t OUTSIDE_COUNT = (1 << OUTSIDE_COUNT_SHIFT);
   /*! \brief Random data for timing operator calls */
-  static std::vector<DType> data_set_;
+  static std::unique_ptr<DType[]> data_set_;
   /*! \brief Operators tuned */
   static std::unordered_set<std::string> operator_names_;
   /*! \brief Arbitary object to modify in OMP loop */
@@ -525,6 +528,10 @@ class OperatorTune : public OperatorTuneByType<DType> {
   /*! \brief Output insertable (into code) instantiation+default-value macros */
   static bool output_tuning_data_;
 };
+
+// TODO(leezu) uncomment once gcc4.8 support is dropped; fixes Wno-undefined-var-template
+// template <typename DType>
+// std::unordered_set<std::string> OperatorTune<DType>::operator_names_;
 
 /*!
  * \brief Class that tunes unary operators

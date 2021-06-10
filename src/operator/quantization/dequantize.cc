@@ -23,7 +23,7 @@
  * \brief
  */
 #include "./dequantize-inl.h"
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 #include "./mkldnn/mkldnn_dequantize-inl.h"
 #endif
 
@@ -37,15 +37,29 @@ bool DequantizeStorageType(const nnvm::NodeAttrs& attrs,
                            std::vector<int> *in_attrs,
                            std::vector<int> *out_attrs) {
   *dispatch_mode = DispatchMode::kFCompute;
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (dev_mask == mshadow::cpu::kDevMask) {
     *dispatch_mode = DispatchMode::kFComputeEx;
   }
 #endif
   (*out_attrs)[0] = kDefaultStorage;
-  (*out_attrs)[1] = kDefaultStorage;
-  (*out_attrs)[2] = kDefaultStorage;
   return true;
+}
+
+static OpStatePtr CreateDequantizeState(const nnvm::NodeAttrs &attrs, Context ctx,
+                                        const std::vector<TShape> &in_shapes,
+                                        const std::vector<int> &in_types) {
+  OpStatePtr state;
+  if (ctx.dev_type == kGPU) {
+    state = OpStatePtr::Create<DequantizeOperator<gpu>>(attrs);
+  } else {
+#if MXNET_USE_ONEDNN == 1
+    state = OpStatePtr::Create<SgMKLDNNDequantizeOperator>(attrs);
+#else
+    state = OpStatePtr::Create<DequantizeOperator<cpu>>(attrs);
+#endif
+  }
+  return state;
 }
 
 NNVM_REGISTER_OP(_contrib_dequantize)
@@ -68,17 +82,22 @@ by keep zero centered for the quantized value:
 .set_attr_parser(ParamParser<DequantizeParam>)
 .set_num_inputs(3)
 .set_num_outputs(1)
+.set_attr<nnvm::FListInputNames>("FListInputNames",
+  [](const NodeAttrs& attrs) {
+    return std::vector<std::string>{"data", "min_range", "max_range"};
+  })
 .set_attr<mxnet::FInferShape>("FInferShape", DequantizeShape)
 .set_attr<nnvm::FInferType>("FInferType", DequantizeType)
 .set_attr<FInferStorageType>("FInferStorageType", DequantizeStorageType)
 // TODO(Xinyu): a temp solution to enable GluonCV INT8 flow,
 // will be reverted after the improvement of CachedOP is done.
 .set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
-#if MXNET_USE_MKLDNN == 1
+.set_attr<FCreateOpState>("FCreateOpState", CreateDequantizeState)
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
-.set_attr<FComputeEx>("FComputeEx<cpu>", MKLDNNDequantizeCompute)
+.set_attr<FStatefulComputeEx>("FStatefulComputeEx<cpu>", SgMKLDNNDequantizeForward)
 #endif
-.set_attr<FCompute>("FCompute<cpu>", DequantizeCompute<cpu>)
+.set_attr<FStatefulCompute>("FStatefulCompute<cpu>", DequantizeForward<cpu>)
 .add_argument("data", "NDArray-or-Symbol", "A ndarray/symbol of type `uint8`")
 .add_argument("min_range", "NDArray-or-Symbol", "The minimum scalar value "
   "possibly produced for the input in float32")

@@ -83,13 +83,14 @@ inline void MultiBoxPriorForward(const Tensor<gpu, 2, DType> &out,
 
   const int stride = 4 * (num_sizes + num_ratios - 1);
   int offset = 0;
-  // ratio = 1, various sizes
+  // ratio = first ratio, various sizes
+  float ratio = num_ratios > 0? sqrtf(ratios[0]) : 1.f;
   for (int i = 0; i < num_sizes; ++i) {
     cuda::AssignPriors<DType><<<dimGrid, dimBlock, 0, stream>>>(out_ptr,
-      sizes[i], 1.f, in_width, in_height, step_x, step_y, offset_y, offset_x, stride, offset);
+      sizes[i], ratio, in_width, in_height, step_x, step_y, offset_y, offset_x, stride, offset);
     ++offset;
   }
-  MULTIBOXPRIOR_CUDA_CHECK(cudaPeekAtLastError());
+  MULTIBOXPRIOR_CUDA_CHECK(cudaGetLastError());
 
   // size = sizes[0], various ratios
   for (int j = 1; j < num_ratios; ++j) {
@@ -98,7 +99,7 @@ inline void MultiBoxPriorForward(const Tensor<gpu, 2, DType> &out,
        offset_y, offset_x, stride, offset);
     ++offset;
   }
-  MULTIBOXPRIOR_CUDA_CHECK(cudaPeekAtLastError());
+  MULTIBOXPRIOR_CUDA_CHECK(cudaGetLastError());
 }
 }  // namespace mshadow
 
@@ -106,7 +107,7 @@ namespace mxnet {
 namespace op {
 template<>
 Operator* CreateOp<gpu>(MultiBoxPriorParam param, int dtype) {
-  Operator *op = NULL;
+  Operator *op = nullptr;
   MSHADOW_REAL_TYPE_SWITCH(dtype, DType, {
     op = new MultiBoxPriorOp<gpu, DType>(param);
   });

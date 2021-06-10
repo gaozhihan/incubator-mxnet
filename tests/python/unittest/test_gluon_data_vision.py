@@ -14,7 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from __future__ import print_function
 from collections import namedtuple
 
 import mxnet as mx
@@ -25,11 +24,11 @@ from mxnet.base import MXNetError
 from mxnet.gluon.data.vision import transforms
 from mxnet import image
 from mxnet.test_utils import *
-from common import assertRaises, setup_module, with_seed, teardown
+from common import assertRaises, xfail_when_nonstandard_decimal_separator
 
 import numpy as np
+import pytest
 
-@with_seed()
 def test_to_tensor():
     # 3D Input
     data_in = np.random.uniform(0, 255, (300, 300, 3)).astype(dtype=np.uint8)
@@ -42,14 +41,22 @@ def test_to_tensor():
     out_nd = transforms.ToTensor()(nd.array(data_in, dtype='uint8'))
     assert_almost_equal(out_nd.asnumpy(), np.transpose(
                         data_in.astype(dtype=np.float32) / 255.0, (0, 3, 1, 2)))
-    
+
     # Invalid Input
     invalid_data_in = nd.random.uniform(0, 255, (5, 5, 300, 300, 3)).astype(dtype=np.uint8)
     transformer = transforms.ToTensor()
     assertRaises(MXNetError, transformer, invalid_data_in)
 
+    # Bounds (0->0, 255->1)
+    data_in = np.zeros((10, 20, 3)).astype(dtype=np.uint8)
+    out_nd = transforms.ToTensor()(nd.array(data_in, dtype='uint8'))
+    assert same(out_nd.asnumpy(), np.transpose(np.zeros(data_in.shape, dtype=np.float32), (2, 0, 1)))
 
-@with_seed()
+    data_in = np.full((10, 20, 3), 255).astype(dtype=np.uint8)
+    out_nd = transforms.ToTensor()(nd.array(data_in, dtype='uint8'))
+    assert same(out_nd.asnumpy(), np.transpose(np.ones(data_in.shape, dtype=np.float32), (2, 0, 1)))
+
+
 def test_normalize():
     # 3D Input
     data_in_3d = nd.random.uniform(0, 1, (3, 300, 300))
@@ -83,7 +90,6 @@ def test_normalize():
     assertRaises(MXNetError, normalize_transformer, invalid_data_in)
 
 
-@with_seed()
 def test_resize():
     def _test_resize_with_diff_type(dtype):
         # test normal case
@@ -117,10 +123,9 @@ def test_resize():
         assertRaises(MXNetError, invalid_transform, data_in)
 
     for dtype in ['uint8', 'float32', 'float64']:
-        _test_resize_with_diff_type(dtype)    
+        _test_resize_with_diff_type(dtype)
 
 
-@with_seed()
 def test_crop_resize():
     def _test_crop_resize_with_diff_type(dtype):
         # test normal case
@@ -137,19 +142,20 @@ def test_crop_resize():
         assert((out_batch_np[0:2,0:4,1,1].flatten() == [37,  52,  67,  82, 127, 142, 157, 172]).all())
         # test normal case with resize
         data_in = nd.random.uniform(0, 255, (300, 200, 3)).astype(dtype)
-        out_nd = transforms.CropResize(0, 0, 100, 50, (25, 25), 2)(data_in)
-        data_expected = image.imresize(nd.slice(data_in, (0, 0, 0), (50, 100 , 3)), 25, 25, 2)
+        out_nd = transforms.CropResize(0, 0, 100, 50, (25, 25), 1)(data_in)
+        data_expected = transforms.Resize(size=25, interpolation=1)(nd.slice(data_in, (0, 0, 0), (50, 100, 3)))
         assert_almost_equal(out_nd.asnumpy(), data_expected.asnumpy())
         # test 4D input with resize
         data_bath_in = nd.random.uniform(0, 255, (3, 300, 200, 3)).astype(dtype)
-        out_batch_nd = transforms.CropResize(0, 0, 100, 50, (25, 25), 2)(data_bath_in)
+        out_batch_nd = transforms.CropResize(0, 0, 100, 50, (25, 25), 1)(data_bath_in)
         for i in range(len(out_batch_nd)):
-            assert_almost_equal(image.imresize(nd.slice(data_bath_in[i], (0, 0, 0), (50, 100, 3)), 25, 25, 2).asnumpy(),
-                out_batch_nd[i].asnumpy())
+            actual = transforms.Resize(size=25, interpolation=1)(nd.slice(data_bath_in[i], (0, 0, 0), (50, 100, 3))).asnumpy()
+            expected = out_batch_nd[i].asnumpy()
+            assert_almost_equal(expected, actual)
         # test with resize height and width should be greater than 0
-        transformer = transforms.CropResize(0, 0, 100, 50, (-25, 25), 2)
+        transformer = transforms.CropResize(0, 0, 100, 50, (-25, 25), 1)
         assertRaises(MXNetError, transformer, data_in)
-        # test height and width should be greater than 0 
+        # test height and width should be greater than 0
         transformer = transforms.CropResize(0, 0, -100, -50)
         assertRaises(MXNetError, transformer, data_in)
         # test cropped area is bigger than input data
@@ -158,7 +164,7 @@ def test_crop_resize():
         assertRaises(MXNetError, transformer, data_bath_in)
 
     for dtype in ['uint8', 'float32', 'float64']:
-        _test_crop_resize_with_diff_type(dtype)  
+        _test_crop_resize_with_diff_type(dtype)
 
     # test nd.image.crop backward
     def test_crop_backward(test_nd_arr, TestCase):
@@ -179,33 +185,24 @@ def test_crop_resize():
         data_in = nd.arange(60).reshape((5, 4, 3)).astype(dtype)
         for test_case in test_list:
             test_crop_backward(data_in, test_case)
-        
 
 
-    # check numeric gradient of nd.image.crop
-    # in_data = np.arange(36).reshape(3, 4, 3)
-    # data = mx.sym.Variable('data')
-    # image_crop_sym = mx.sym.image.crop(data, 0, 0, 2, 2)
-    # check_numeric_gradient(image_crop_sym, [in_data])
-
-
-@with_seed()
 def test_flip_left_right():
-    data_in = np.random.uniform(0, 255, (300, 300, 3)).astype(dtype=np.uint8)
-    flip_in = data_in[:, ::-1, :]
-    data_trans = nd.image.flip_left_right(nd.array(data_in, dtype='uint8'))
-    assert_almost_equal(flip_in, data_trans.asnumpy())
+    for width in range(3, 301, 7):
+        data_in = np.random.uniform(0, 255, (300, width, 3)).astype(dtype=np.uint8)
+        flip_in = data_in[:, ::-1, :]
+        data_trans = nd.image.flip_left_right(nd.array(data_in, dtype='uint8'))
+        assert_almost_equal(flip_in, data_trans.asnumpy())
 
 
-@with_seed()
 def test_flip_top_bottom():
-    data_in = np.random.uniform(0, 255, (300, 300, 3)).astype(dtype=np.uint8)
-    flip_in = data_in[::-1, :, :]
-    data_trans = nd.image.flip_top_bottom(nd.array(data_in, dtype='uint8'))
-    assert_almost_equal(flip_in, data_trans.asnumpy())
+    for height in range(3, 301, 7):
+        data_in = np.random.uniform(0, 255, (height, 300, 3)).astype(dtype=np.uint8)
+        flip_in = data_in[::-1, :, :]
+        data_trans = nd.image.flip_top_bottom(nd.array(data_in, dtype='uint8'))
+        assert_almost_equal(flip_in, data_trans.asnumpy())
 
 
-@with_seed()
 def test_transformer():
     from mxnet.gluon.data.vision import transforms
 
@@ -213,7 +210,39 @@ def test_transformer():
         transforms.Resize(300),
         transforms.Resize(300, keep_ratio=True),
         transforms.CenterCrop(256),
+        transforms.RandomCrop(256, pad=16),
         transforms.RandomResizedCrop(224),
+        transforms.RandomFlipLeftRight(),
+        transforms.RandomColorJitter(0.1, 0.1, 0.1, 0.1),
+        transforms.RandomBrightness(0.1),
+        transforms.RandomContrast(0.1),
+        transforms.RandomSaturation(0.1),
+        transforms.RandomHue(0.1),
+        transforms.RandomLighting(0.1),
+        transforms.ToTensor(),
+        transforms.RandomRotation([-10., 10.]),
+        transforms.Normalize([0, 0, 0], [1, 1, 1])])
+
+    transform(mx.nd.ones((245, 480, 3), dtype='uint8')).wait_to_read()
+
+def test_random_crop():
+    x = mx.nd.ones((245, 480, 3), dtype='uint8')
+    y = mx.nd.image.random_crop(x, width=100, height=100)
+    assert y.shape == (100, 100, 3)
+
+def test_random_resize_crop():
+    x = mx.nd.ones((245, 480, 3), dtype='uint8')
+    y = mx.nd.image.random_resized_crop(x, width=100, height=100)
+    assert y.shape == (100, 100, 3)
+
+def test_hybrid_transformer():
+    from mxnet.gluon.data.vision import transforms
+
+    transform = transforms.HybridCompose([
+        transforms.Resize(300),
+        transforms.Resize(300, keep_ratio=True),
+        transforms.CenterCrop(256),
+        transforms.RandomCrop(256, pad=16),
         transforms.RandomFlipLeftRight(),
         transforms.RandomColorJitter(0.1, 0.1, 0.1, 0.1),
         transforms.RandomBrightness(0.1),
@@ -226,8 +255,179 @@ def test_transformer():
 
     transform(mx.nd.ones((245, 480, 3), dtype='uint8')).wait_to_read()
 
+def test_rotate():
+    transformer = transforms.Rotate(10.)
+    assertRaises(TypeError, transformer, mx.nd.ones((3, 30, 60), dtype='uint8'))
+    single_image = mx.nd.ones((3, 30, 60), dtype='float32')
+    single_output = transformer(single_image)
+    assert same(single_output.shape, (3, 30, 60))
+    batch_image = mx.nd.ones((3, 3, 30, 60), dtype='float32')
+    batch_output = transformer(batch_image)
+    assert same(batch_output.shape, (3, 3, 30, 60))
+
+    input_image = nd.array([[[0., 0., 0.],
+                             [0., 0., 1.],
+                             [0., 0., 0.]]])
+    rotation_angles_expected_outs = [
+        (90., nd.array([[[0., 1., 0.],
+                         [0., 0., 0.],
+                         [0., 0., 0.]]])),
+        (180., nd.array([[[0., 0., 0.],
+                          [1., 0., 0.],
+                          [0., 0., 0.]]])),
+        (270., nd.array([[[0., 0., 0.],
+                          [0., 0., 0.],
+                          [0., 1., 0.]]])),
+        (360., nd.array([[[0., 0., 0.],
+                          [0., 0., 1.],
+                          [0., 0., 0.]]])),
+    ]
+    for rot_angle, expected_result in rotation_angles_expected_outs:
+        transformer = transforms.Rotate(rot_angle)
+        ans = transformer(input_image)
+        print(ans, expected_result)
+        assert_almost_equal(ans, expected_result, atol=1e-6)
 
 
-if __name__ == '__main__':
-    import nose
-    nose.runmodule()
+def test_random_rotation():
+    # test exceptions for probability input outside of [0,1]
+    assertRaises(ValueError, transforms.RandomRotation, [-10, 10.], rotate_with_proba=1.1)
+    assertRaises(ValueError, transforms.RandomRotation, [-10, 10.], rotate_with_proba=-0.3)
+    # test `forward`
+    transformer = transforms.RandomRotation([-10, 10.])
+    assertRaises(TypeError, transformer, mx.nd.ones((3, 30, 60), dtype='uint8'))
+    single_image = mx.nd.ones((3, 30, 60), dtype='float32')
+    single_output = transformer(single_image)
+    assert same(single_output.shape, (3, 30, 60))
+    batch_image = mx.nd.ones((3, 3, 30, 60), dtype='float32')
+    batch_output = transformer(batch_image)
+    assert same(batch_output.shape, (3, 3, 30, 60))
+    # test identity (rotate_with_proba = 0)
+    transformer = transforms.RandomRotation([-100., 100.], rotate_with_proba=0.0)
+    data = mx.nd.random_normal(shape=(3, 30, 60))
+    assert_almost_equal(data, transformer(data))
+
+
+@xfail_when_nonstandard_decimal_separator
+def test_rotate():
+    transformer = transforms.Rotate(10.)
+    assertRaises(TypeError, transformer, mx.nd.ones((3, 30, 60), dtype='uint8'))
+    single_image = mx.nd.ones((3, 30, 60), dtype='float32')
+    single_output = transformer(single_image)
+    assert same(single_output.shape, (3, 30, 60))
+    batch_image = mx.nd.ones((3, 3, 30, 60), dtype='float32')
+    batch_output = transformer(batch_image)
+    assert same(batch_output.shape, (3, 3, 30, 60))
+
+    input_image = nd.array([[[0., 0., 0.],
+                             [0., 0., 1.],
+                             [0., 0., 0.]]])
+    rotation_angles_expected_outs = [
+        (90., nd.array([[[0., 1., 0.],
+                         [0., 0., 0.],
+                         [0., 0., 0.]]])),
+        (180., nd.array([[[0., 0., 0.],
+                          [1., 0., 0.],
+                          [0., 0., 0.]]])),
+        (270., nd.array([[[0., 0., 0.],
+                          [0., 0., 0.],
+                          [0., 1., 0.]]])),
+        (360., nd.array([[[0., 0., 0.],
+                          [0., 0., 1.],
+                          [0., 0., 0.]]])),
+    ]
+    for rot_angle, expected_result in rotation_angles_expected_outs:
+        transformer = transforms.Rotate(rot_angle)
+        ans = transformer(input_image)
+        print(ans, expected_result)
+        assert_almost_equal(ans, expected_result, atol=1e-6)
+
+
+def test_random_rotation():
+    # test exceptions for probability input outside of [0,1]
+    assertRaises(ValueError, transforms.RandomRotation, [-10, 10.], rotate_with_proba=1.1)
+    assertRaises(ValueError, transforms.RandomRotation, [-10, 10.], rotate_with_proba=-0.3)
+    # test `forward`
+    transformer = transforms.RandomRotation([-10, 10.])
+    assertRaises(TypeError, transformer, mx.nd.ones((3, 30, 60), dtype='uint8'))
+    single_image = mx.nd.ones((3, 30, 60), dtype='float32')
+    single_output = transformer(single_image)
+    assert same(single_output.shape, (3, 30, 60))
+    batch_image = mx.nd.ones((3, 3, 30, 60), dtype='float32')
+    batch_output = transformer(batch_image)
+    assert same(batch_output.shape, (3, 3, 30, 60))
+    # test identity (rotate_with_proba = 0)
+    transformer = transforms.RandomRotation([-100., 100.], rotate_with_proba=0.0)
+    data = mx.nd.random_normal(shape=(3, 30, 60))
+    assert_almost_equal(data, transformer(data))
+
+
+def test_random_transforms():
+    from mxnet.gluon.data.vision import transforms
+
+    counter = 0
+    def transform_fn(x):
+        nonlocal counter
+        counter += 1
+        return x
+    transform = transforms.Compose([transforms.RandomApply(transform_fn, 0.5)])
+
+    img = mx.np.ones((10, 10, 3), dtype='uint8')
+    iteration = 10000
+    num_apply = 0
+    for _ in range(iteration):
+        out = transform(img)
+    assert counter == pytest.approx(5000, 1e-1)
+
+@xfail_when_nonstandard_decimal_separator
+@pytest.mark.flaky
+def test_random_gray():
+    from mxnet.gluon.data.vision import transforms
+
+    transform = transforms.RandomGray(0.5)
+    img = mx.nd.ones((4, 4, 3), dtype='uint8')
+    pixel = img[0, 0, 0].asnumpy()
+    iteration = 1000
+    num_apply = 0
+    for _ in range(iteration):
+        out = transform(img)
+        if out[0][0][0].asnumpy() != pixel:
+            num_apply += 1
+    assert_almost_equal(num_apply/float(iteration), 0.5, 0.1)
+
+    transform = transforms.RandomGray(0.5)
+    transform.hybridize()
+    img = mx.nd.ones((4, 4, 3), dtype='uint8')
+    pixel = img[0, 0, 0].asnumpy()
+    iteration = 1000
+    num_apply = 0
+    for _ in range(iteration):
+        out = transform(img)
+        if out[0][0][0].asnumpy() != pixel:
+            num_apply += 1
+    assert_almost_equal(num_apply/float(iteration), 0.5, 0.1)
+
+def test_bbox_random_flip():
+    from mxnet.gluon.contrib.data.vision.transforms.bbox import ImageBboxRandomFlipLeftRight
+
+    transform = ImageBboxRandomFlipLeftRight(0.5)
+    iteration = 200
+    num_apply = 0
+    for _ in range(iteration):
+        img = mx.nd.ones((10, 10, 3), dtype='uint8')
+        img[0, 0, 0] = 10
+        bbox = mx.nd.array([[1, 2, 3, 4, 0]])
+        im_out, im_bbox = transform(img, bbox)
+        if im_bbox[0][0].asnumpy() != 1 and im_out[0, 0, 0].asnumpy() != 10:
+            num_apply += 1
+    assert_almost_equal(np.array([num_apply])/float(iteration), 0.5, 0.5)
+
+def test_bbox_crop():
+    from mxnet.gluon.contrib.data.vision.transforms.bbox import ImageBboxCrop
+
+    transform = ImageBboxCrop((0, 0, 3, 3))
+    img = mx.nd.ones((10, 10, 3), dtype='uint8')
+    bbox = mx.nd.array([[0, 1, 3, 4, 0]])
+    im_out, im_bbox = transform(img, bbox)
+    assert im_out.shape == (3, 3, 3)
+    assert im_bbox[0][2] == 3

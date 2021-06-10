@@ -26,6 +26,7 @@
 #include "./softmax_output-inl.h"
 #if MXNET_USE_MKLDNN == 1
 #include "./nn/mkldnn/mkldnn_ops-inl.h"
+#include "./nn/mkldnn/mkldnn_base-inl.h"
 #endif
 namespace mxnet {
 namespace op {
@@ -33,7 +34,7 @@ namespace op {
 DMLC_REGISTER_PARAMETER(SoftmaxOutputParam);
 struct SoftmaxOutputGrad {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
   std::vector<nnvm::NodeEntry> out_data(n->num_outputs());
   for (uint32_t i = 0; i < out_data.size(); ++i) {
@@ -43,7 +44,7 @@ struct SoftmaxOutputGrad {
   heads.push_back(out_data[softmaxout_enum::kOut]);
   heads.push_back(n->inputs[softmaxout_enum::kLabel]);
 
-  nnvm::NodePtr gnode = nnvm::Node::Create();
+  nnvm::ObjectPtr gnode = nnvm::Node::Create();
   gnode->inputs = std::move(heads);
   gnode->control_deps.emplace_back(n);
   gnode->attrs = n->attrs;
@@ -65,7 +66,21 @@ static bool SoftmaxOutputType(const nnvm::NodeAttrs& attrs,
                               std::vector<int> *out_type) {
   CHECK_EQ(in_type->size(), 2U);
   int dtype = (*in_type)[0];
-  CHECK_NE(dtype, -1) << "First input must have specified type";
+  if (type_is_none(dtype)) {
+    // Input type is undefined, we try backward inference
+    if (out_type->size() == 0 || type_is_none((*out_type)[0])) {
+      // Neither the input nor the output are defined,
+      // types cannot be infered for this op
+      return false;
+    } else {
+      // Input type is undefined but output type is: backward inference
+      dtype = (*out_type)[0];
+    }
+  } else {
+    // Input type is defined but output type is not: forward inference
+    out_type->clear();
+    out_type->push_back(dtype);
+  }
   for (size_t i = 0; i < in_type->size(); ++i) {
     if ((*in_type)[i] == -1) {
       (*in_type)[i] = dtype;
@@ -73,8 +88,6 @@ static bool SoftmaxOutputType(const nnvm::NodeAttrs& attrs,
       UNIFORM_TYPE_CHECK((*in_type)[i], dtype, ListArguments()[i]);
     }
   }
-  out_type->clear();
-  out_type->push_back(dtype);
   return true;
 }
 
@@ -85,19 +98,19 @@ static bool SoftmaxOutputShape(const nnvm::NodeAttrs& attrs,
   const SoftmaxOutputParam& param = nnvm::get<SoftmaxOutputParam>(attrs.parsed);
   CHECK_EQ(in_shape->size(), 2U) << "Input:[data, label]";
   const mxnet::TShape &dshape = in_shape->at(0);
-  if (dshape.ndim() == 0) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
 
   // label.shape == data.shape: use probability as label
   if (dshape != (*in_shape)[softmaxout_enum::kLabel]) {
     if (param.multi_output) {
       mxnet::TShape lshape1 = Shape2(dshape[0], dshape.Size()/dshape[0]/dshape[1]);
-      mxnet::TShape lshape2(dshape.ndim() - 1);
+      mxnet::TShape lshape2(dshape.ndim() - 1, -1);
       lshape2[0] = dshape[0];
-      for (index_t i = 2; i < dshape.ndim(); ++i)
+      for (int i = 2; i < dshape.ndim(); ++i)
         lshape2[i-1] = dshape[i];
       mxnet::TShape lshape3 = dshape;
       lshape3[1] = 1;
-      if (in_shape->at(softmaxout_enum::kLabel).ndim() == 0) {
+      if (!mxnet::ndim_is_known(in_shape->at(softmaxout_enum::kLabel))) {
         in_shape->at(softmaxout_enum::kLabel) = lshape1;
       } else if (in_shape->at(softmaxout_enum::kLabel) == lshape1) {
       } else if (in_shape->at(softmaxout_enum::kLabel) == lshape2) {
@@ -109,8 +122,8 @@ static bool SoftmaxOutputShape(const nnvm::NodeAttrs& attrs,
         throw InferShapeError(os.str(), softmaxout_enum::kLabel);
       }
     } else {
-      mxnet::TShape label_shape(dshape.ndim() - 1);
-      for (index_t i = 0; i + 1 < dshape.ndim(); ++i)
+      mxnet::TShape label_shape(dshape.ndim() - 1, -1);
+      for (int i = 0; i + 1 < dshape.ndim(); ++i)
         label_shape[i] = dshape[i];
       SHAPE_ASSIGN_CHECK(*in_shape, softmaxout_enum::kLabel, label_shape);
     }
@@ -143,7 +156,7 @@ void SoftmaxOutputComputeExCPU(const nnvm::NodeAttrs &attrs,
   const SoftmaxOutputParam &param = nnvm::get<SoftmaxOutputParam>(attrs.parsed);
   if (SupportMKLDNN(inputs[0]) && !ctx.is_train && SupportMKLDNNSoftmaxOutput(param)) {
     MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
-    MKLDNNSoftmaxOutputForward(attrs, ctx, inputs, req, outputs);
+    MKLDNNRun(MKLDNNSoftmaxOutputForward, attrs, ctx, inputs, req, outputs);
     MKLDNN_OPCHECK_RUN(SoftmaxOutputCompute<cpu>, attrs, ctx, inputs, req, outputs);
     return;
   }
@@ -257,6 +270,7 @@ NNVM_REGISTER_OP(SoftmaxOutput)
 NNVM_REGISTER_OP(SoftmaxOutput).add_alias("Softmax");
 
 NNVM_REGISTER_OP(_backward_SoftmaxOutput)
+.set_num_inputs(2)
 .set_num_outputs(2)
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
 .set_attr<nnvm::FInplaceOption>("FInplaceOption", [](const NodeAttrs& attrs){

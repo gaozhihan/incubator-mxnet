@@ -33,6 +33,7 @@
 #include <dmlc/omp.h>
 #include <dmlc/common.h>
 #include <dmlc/timer.h>
+#include <memory>
 #include <type_traits>
 #if MXNET_USE_LIBJPEG_TURBO
 #include <turbojpeg.h>
@@ -42,8 +43,10 @@
 #include "./image_iter_common.h"
 #include "./inst_vector.h"
 #include "../common/utils.h"
+#include "../profiler/profiler.h"
 
 namespace mxnet {
+
 namespace io {
 // parser to parse image recordio
 template<typename DType>
@@ -53,7 +56,7 @@ class ImageRecordIOParser2 {
   inline void Init(const std::vector<std::pair<std::string, std::string> >& kwargs);
 
   // set record to the head
-  inline void BeforeFirst(void) {
+  inline void BeforeFirst() {
     if (batch_param_.round_batch == 0 || !overflow) {
       n_parsed_ = 0;
       return source_->BeforeFirst();
@@ -77,7 +80,7 @@ class ImageRecordIOParser2 {
 #endif
   inline size_t ParseChunk(DType* data_dptr, real_t* label_dptr, const size_t current_size,
     dmlc::InputSplit::Blob * chunk);
-  inline void CreateMeanImg(void);
+  inline void CreateMeanImg();
 
   // magic number to seed prng
   static const int kRandMagic = 111;
@@ -87,7 +90,7 @@ class ImageRecordIOParser2 {
   ImageRecordParam record_param_;
   BatchParam batch_param_;
   ImageNormalizeParam normalize_param_;
-  PrefetcherParam prefetch_param_;
+
   #if MXNET_USE_OPENCV
   /*! \brief augmenters */
   std::vector<std::vector<std::unique_ptr<ImageAugmenter> > > augmenters_;
@@ -133,20 +136,25 @@ inline void ImageRecordIOParser2<DType>::Init(
   record_param_.InitAllowUnknown(kwargs);
   batch_param_.InitAllowUnknown(kwargs);
   normalize_param_.InitAllowUnknown(kwargs);
-  prefetch_param_.InitAllowUnknown(kwargs);
+  PrefetcherParam prefetch_param;
+  prefetch_param.InitAllowUnknown(kwargs);
   n_parsed_ = 0;
   overflow = false;
   rnd_.seed(kRandMagic + record_param_.seed);
   int maxthread, threadget;
-  #pragma omp parallel
-  {
-    // be conservative, set number of real cores
-    maxthread = std::max(omp_get_num_procs() / 2 - 1, 1);
-  }
-  param_.preprocess_threads = std::min(maxthread, param_.preprocess_threads);
-  #pragma omp parallel num_threads(param_.preprocess_threads)
-  {
-    threadget = omp_get_num_threads();
+  if (prefetch_param.ctx == PrefetcherParam::CtxType::kCPU) {
+    threadget = engine::OpenMP::Get()->GetRecommendedOMPThreadCount();
+  } else {
+    #pragma omp parallel
+    {
+      // be conservative, set number of real cores
+      maxthread = std::max(omp_get_num_procs() / 2, 1);
+    }
+    param_.preprocess_threads = std::min(maxthread, param_.preprocess_threads);
+    #pragma omp parallel num_threads(param_.preprocess_threads)
+    {
+      threadget = omp_get_num_threads();
+    }
   }
   param_.preprocess_threads = threadget;
 
@@ -162,8 +170,8 @@ inline void ImageRecordIOParser2<DType>::Init(
     prnds_.emplace_back(new common::RANDOM_ENGINE((i + 1) * kRandMagic));
   }
   if (param_.path_imglist.length() != 0) {
-    label_map_.reset(new ImageLabelMap(param_.path_imglist.c_str(),
-      param_.label_width, !param_.verbose));
+    label_map_ = std::make_unique<ImageLabelMap>(param_.path_imglist.c_str(),
+      param_.label_width, !param_.verbose);
   }
   CHECK(param_.path_imgrec.length() != 0)
       << "ImageRecordIter2: must specify image_rec";
@@ -290,10 +298,16 @@ inline bool ImageRecordIOParser2<DType>::ParseNext(DataBatch *out) {
     if (dev_id != -1) {
       ctx = Context::CPUPinned(dev_id);
     }
+
+    const std::string profiler_scope =
+        profiler::ProfilerScope::Get()->GetCurrentProfilerScope() + "image_io:";
+
     out->data.at(0) = NDArray(data_shape, ctx, false,
       mshadow::DataType<DType>::kFlag);
+    out->data.at(0).AssignStorageInfo(profiler_scope, "data");
     out->data.at(1) = NDArray(label_shape, ctx, false,
       mshadow::DataType<real_t>::kFlag);
+    out->data.at(1).AssignStorageInfo(profiler_scope, "label");
     unit_size_[0] = param_.data_shape.Size();
     unit_size_[1] = param_.label_width;
   }
@@ -652,7 +666,7 @@ inline size_t ImageRecordIOParser2<DType>::ParseChunk(DType* data_dptr, real_t* 
 
 // create mean image.
 template<typename DType>
-inline void ImageRecordIOParser2<DType>::CreateMeanImg(void) {
+inline void ImageRecordIOParser2<DType>::CreateMeanImg() {
     if (param_.verbose) {
       LOG(INFO) << "Cannot find " << normalize_param_.mean_img
                 << ": create mean image, this will take some time...";
@@ -664,8 +678,7 @@ inline void ImageRecordIOParser2<DType>::CreateMeanImg(void) {
       inst_order_.clear();
       // Parse chunk w/o putting anything in out
       ParseChunk(nullptr, nullptr, batch_param_.batch_size, &chunk);
-      for (size_t i = 0; i < inst_order_.size(); ++i) {
-        std::pair<size_t, size_t> place = inst_order_[i];
+      for (auto place : inst_order_) {
         mshadow::Tensor<cpu, 3> outimg =
           temp_[place.first][place.second].data[0].template get<cpu, 3, real_t>();
         if (imcnt == 0) {
@@ -701,13 +714,13 @@ inline void ImageRecordIOParser2<DType>::CreateMeanImg(void) {
 template<typename DType = real_t>
 class ImageRecordIter2 : public IIterator<DataBatch> {
  public:
-    ImageRecordIter2() : out_(nullptr) { }
+    ImageRecordIter2()  = default;
 
-    virtual ~ImageRecordIter2(void) {
+    ~ImageRecordIter2() override {
       iter_.Destroy();
     }
 
-    virtual void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) {
+    void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) override {
       prefetch_param_.InitAllowUnknown(kwargs);
       parser_.Init(kwargs);
       // maximum prefetch threaded iter internal size
@@ -724,12 +737,12 @@ class ImageRecordIter2 : public IIterator<DataBatch> {
           [this]() { parser_.BeforeFirst(); });
     }
 
-    virtual void BeforeFirst(void) {
+    void BeforeFirst() override {
       iter_.BeforeFirst();
     }
 
     // From iter_prefetcher.h
-    virtual bool Next(void) {
+    bool Next() override {
       if (out_ != nullptr) {
         recycle_queue_.push(out_); out_ = nullptr;
       }
@@ -746,7 +759,7 @@ class ImageRecordIter2 : public IIterator<DataBatch> {
       return iter_.Next(&out_);
     }
 
-    virtual const DataBatch &Value(void) const {
+    const DataBatch &Value() const override {
       return *out_;
     }
 
@@ -756,11 +769,119 @@ class ImageRecordIter2 : public IIterator<DataBatch> {
     /*! \brief Parameters */
     PrefetcherParam prefetch_param_;
     /*! \brief output data */
-    DataBatch *out_;
+    DataBatch *out_{nullptr};
     /*! \brief queue to be recycled */
     std::queue<DataBatch*> recycle_queue_;
     /* \brief parser */
     ImageRecordIOParser2<DType> parser_;
+};
+
+template<typename DType = real_t>
+class ImageRecordIter2CPU : public IIterator<DataBatch> {
+ public:
+  ImageRecordIter2CPU() {
+    out_ = new DataBatch();
+    var_ = Engine::Get()->NewVariable();
+  }
+
+  ~ImageRecordIter2CPU() override {
+    Engine::Get()->DeleteVariable([](mxnet::RunContext ctx) {}, Context::CPU(), var_);
+    delete out_;
+  }
+
+  void Init(const std::vector<std::pair<std::string, std::string>>& kwargs) override {
+    parser_.Init(kwargs);
+  }
+
+  void BeforeFirst() override { parser_.BeforeFirst(); }
+
+  // From iter_prefetcher.h
+  bool Next() override {
+    bool result = false;
+    const auto engine = Engine::Get();
+    engine->PushSync(
+        [this, &result](RunContext ctx) {
+          result = this->parser_.ParseNext(out_);
+        },
+        Context::CPU(), {}, {var_}, FnProperty::kNormal, 0, "DataLoader");
+    engine->WaitForVar(var_);
+    return result;
+  }
+
+  const DataBatch& Value() const override { return *out_; }
+
+ private:
+  /*! \brief Backend thread */
+  dmlc::ThreadedIter<DataBatch> iter_;
+  /*! \brief output data */
+  DataBatch* out_;
+  Engine::VarHandle var_;
+  /*! \brief queue to be recycled */
+  std::queue<DataBatch*> recycle_queue_;
+  /* \brief parser */
+  ImageRecordIOParser2<DType> parser_;
+};
+
+class ImageRecordIter2Wrapper : public IIterator<DataBatch> {
+ public:
+  ~ImageRecordIter2Wrapper() override {
+    if (record_iter_) delete record_iter_;
+  }
+  void Init(const std::vector<std::pair<std::string, std::string>>& kwargs) override {
+    PrefetcherParam prefetch_param;
+    prefetch_param.InitAllowUnknown(kwargs);
+    int dtype = mshadow::kFloat32;
+    if (prefetch_param.dtype.has_value()) {
+      dtype = prefetch_param.dtype.value();
+    }
+    if (prefetch_param.ctx == PrefetcherParam::CtxType::kCPU) {
+      LOG(INFO) << "Create ImageRecordIter2 optimized for CPU backend."
+                << "Use omp threads instead of preprocess_threads.";
+      switch (dtype) {
+        case mshadow::kFloat32:
+          record_iter_ = new ImageRecordIter2CPU<float>();
+          break;
+        case mshadow::kUint8:
+          record_iter_ = new ImageRecordIter2CPU<uint8_t>();
+          break;
+        case mshadow::kInt8:
+          record_iter_ = new ImageRecordIter2CPU<int8_t>();
+          break;
+        default:
+          LOG(FATAL) << "unknown dtype for ImageRecordIter2.";
+      }
+    } else {
+      // For gpu
+      switch (dtype) {
+        case mshadow::kFloat32:
+          record_iter_ = new ImageRecordIter2<float>();
+          break;
+        case mshadow::kUint8:
+          record_iter_ = new ImageRecordIter2<uint8_t>();
+          break;
+        case mshadow::kInt8:
+          record_iter_ = new ImageRecordIter2<int8_t>();
+          break;
+        default:
+          LOG(FATAL) << "unknown dtype for ImageRecordIter2.";
+      }
+    }
+    record_iter_->Init(kwargs);
+    }
+
+    void BeforeFirst() override {
+      record_iter_->BeforeFirst();
+    }
+
+    // From iter_prefetcher.h
+    bool Next() override { return record_iter_->Next(); }
+
+    const DataBatch &Value() const override {
+      return record_iter_->Value();
+    }
+
+ private:
+  IIterator<DataBatch>* record_iter_ = nullptr;
 };
 
 MXNET_REGISTER_IO_ITER(ImageRecordIter)
@@ -795,11 +916,13 @@ Example::
 .add_arguments(ListDefaultAugParams())
 .add_arguments(ImageNormalizeParam::__FIELDS__())
 .set_body([]() {
-    return new ImageRecordIter2<real_t>();
+    return new ImageRecordIter2Wrapper();
     });
 
 MXNET_REGISTER_IO_ITER(ImageRecordUInt8Iter)
 .describe(R"code(Iterating on image RecordIO files
+
+.. note:: ImageRecordUInt8Iter is deprecated. Use ImageRecordIter(dtype='uint8') instead.
 
 This iterator is identical to ``ImageRecordIter`` except for using ``uint8`` as
 the data type instead of ``float``.
@@ -816,6 +939,8 @@ the data type instead of ``float``.
 
 MXNET_REGISTER_IO_ITER(ImageRecordInt8Iter)
 .describe(R"code(Iterating on image RecordIO files
+
+.. note:: ``ImageRecordInt8Iter`` is deprecated. Use ImageRecordIter(dtype='int8') instead.
 
 This iterator is identical to ``ImageRecordIter`` except for using ``int8`` as
 the data type instead of ``float``.

@@ -19,8 +19,6 @@
 # pylint: disable=wildcard-import, unused-wildcard-import, too-many-lines
 """Sparse NDArray API of MXNet."""
 
-from __future__ import absolute_import
-from __future__ import division
 try:
     from __builtin__ import slice as py_slice
     from __builtin__ import sum as py_sum
@@ -41,7 +39,7 @@ import numpy as np
 from ..base import NotSupportedForSparseNDArray
 from ..base import _LIB, numeric_types
 from ..base import c_array_buf, mx_real_t, integer_types
-from ..base import mx_uint, NDArrayHandle, check_call
+from ..base import NDArrayHandle, check_call
 from ..context import Context, current_context
 from . import _internal
 from . import op
@@ -51,7 +49,7 @@ except ImportError:
     gs_retain = None
 from ._internal import _set_ndarray_class
 from .ndarray import NDArray, _storage_type, _DTYPE_NP_TO_MX, _DTYPE_MX_TO_NP
-from .ndarray import _STORAGE_TYPE_STR_TO_ID, _STORAGE_TYPE_ROW_SPARSE, _STORAGE_TYPE_CSR
+from .ndarray import _STORAGE_TYPE_STR_TO_ID, _STORAGE_TYPE_ROW_SPARSE, _STORAGE_TYPE_CSR, _int64_enabled
 from .ndarray import _STORAGE_TYPE_UNDEFINED, _STORAGE_TYPE_DEFAULT
 from .ndarray import zeros as _zeros_ndarray
 from .ndarray import array as _array
@@ -87,20 +85,35 @@ def _new_alloc_handle(stype, shape, ctx, delay_alloc, dtype, aux_types, aux_shap
     aux_shapes = [(0,) for aux_t in aux_types] if aux_shapes is None else aux_shapes
     aux_shape_lens = [len(aux_shape) for aux_shape in aux_shapes]
     aux_shapes = py_sum(aux_shapes, ())
-    num_aux = mx_uint(len(aux_types))
-    check_call(_LIB.MXNDArrayCreateSparseEx(
-        ctypes.c_int(int(_STORAGE_TYPE_STR_TO_ID[stype])),
-        c_array_buf(mx_uint, native_array('I', shape)),
-        mx_uint(len(shape)),
-        ctypes.c_int(ctx.device_typeid),
-        ctypes.c_int(ctx.device_id),
-        ctypes.c_int(int(delay_alloc)),
-        ctypes.c_int(int(_DTYPE_NP_TO_MX[np.dtype(dtype).type])),
-        num_aux,
-        c_array_buf(ctypes.c_int, native_array('i', aux_type_ids)),
-        c_array_buf(mx_uint, native_array('I', aux_shape_lens)),
-        c_array_buf(mx_uint, native_array('I', aux_shapes)),
-        ctypes.byref(hdl)))
+    num_aux = ctypes.c_uint(len(aux_types))
+    if _int64_enabled():
+        check_call(_LIB.MXNDArrayCreateSparseEx64(
+            ctypes.c_int(int(_STORAGE_TYPE_STR_TO_ID[stype])),
+            c_array_buf(ctypes.c_int64, native_array('q', shape)),
+            ctypes.c_int(len(shape)),
+            ctypes.c_int(ctx.device_typeid),
+            ctypes.c_int(ctx.device_id),
+            ctypes.c_int(int(delay_alloc)),
+            ctypes.c_int(int(_DTYPE_NP_TO_MX[np.dtype(dtype).type])),
+            num_aux,
+            c_array_buf(ctypes.c_int, native_array('i', aux_type_ids)),
+            c_array_buf(ctypes.c_int, native_array('i', aux_shape_lens)),
+            c_array_buf(ctypes.c_int64, native_array('q', aux_shapes)),
+            ctypes.byref(hdl)))
+    else:
+        check_call(_LIB.MXNDArrayCreateSparseEx(
+            ctypes.c_int(int(_STORAGE_TYPE_STR_TO_ID[stype])),
+            c_array_buf(ctypes.c_uint, native_array('I', shape)),
+            ctypes.c_uint(len(shape)),
+            ctypes.c_int(ctx.device_typeid),
+            ctypes.c_int(ctx.device_id),
+            ctypes.c_int(int(delay_alloc)),
+            ctypes.c_int(int(_DTYPE_NP_TO_MX[np.dtype(dtype).type])),
+            num_aux,
+            c_array_buf(ctypes.c_int, native_array('i', aux_type_ids)),
+            c_array_buf(ctypes.c_uint, native_array('I', aux_shape_lens)),
+            c_array_buf(ctypes.c_uint, native_array('I', aux_shapes)),
+            ctypes.byref(hdl)))
     return hdl
 
 
@@ -217,6 +230,7 @@ class BaseSparseNDArray(NDArray):
         if not copy and np.dtype(dtype) == self.dtype:
             return self
 
+        # Use copyto for casting, as op.cast(self, dtype=dtype) doesn't support sparse stype
         res = zeros(shape=self.shape, ctx=self.context,
                     dtype=dtype, stype=self.stype)
         self.copyto(res)
@@ -553,8 +567,8 @@ class CSRNDArray(BaseSparseNDArray):
         indices = self.indices.asnumpy()
         indptr = self.indptr.asnumpy()
         if not spsp:
-            raise ImportError("scipy is not available. \
-                               Please check if the scipy python bindings are installed.")
+            raise ImportError("scipy could not be imported. "
+                              "Please make sure that the scipy is installed.")
         return spsp.csr_matrix((data, indices, indptr), shape=self.shape, dtype=self.dtype)
 
 # pylint: disable=abstract-method
@@ -641,8 +655,8 @@ class RowSparseNDArray(BaseSparseNDArray):
         if isinstance(key, py_slice):
             if key.step is not None or key.start is not None or key.stop is not None:
                 raise Exception('RowSparseNDArray only supports [:] for __getitem__')
-            else:
-                return self
+
+            return self
         if isinstance(key, tuple):
             raise ValueError('Multi-dimension indexing is not supported')
         raise ValueError('Undefined behaviour for {}'.format(key))
@@ -940,6 +954,9 @@ def csr_matrix(arg1, shape=None, ctx=None, dtype=None):
                     row = row.asnumpy()
                 if isinstance(col, NDArray):
                     col = col.asnumpy()
+                if not spsp:
+                    raise ImportError("scipy could not be imported. "
+                                      "Please make sure that the scipy is installed.")
                 coo = spsp.coo_matrix((data, (row, col)), shape=shape)
                 _check_shape(coo.shape, shape)
                 csr = coo.tocsr()
@@ -1104,7 +1121,7 @@ def row_sparse_array(arg1, shape=None, ctx=None, dtype=None):
         arg_len = len(arg1)
         if arg_len < 2:
             raise ValueError("Unexpected length of input tuple: " + str(arg_len))
-        elif arg_len > 2:
+        if arg_len > 2:
             # empty ndarray with shape
             _check_shape(arg1, shape)
             return empty('row_sparse', arg1, ctx=ctx, dtype=dtype)
@@ -1538,7 +1555,7 @@ def zeros(stype, shape, ctx=None, dtype=None, **kwargs):
     if stype in ('row_sparse', 'csr'):
         aux_types = _STORAGE_AUX_TYPES[stype]
     else:
-        raise ValueError("unknown storage type" + stype)
+        raise ValueError("unknown storage type: " + stype)
     out = _ndarray_cls(_new_alloc_handle(stype, shape, ctx, True, dtype, aux_types))
     return _internal._zeros(shape=shape, ctx=ctx, dtype=dtype, out=out, **kwargs)
     # pylint: enable= no-member, protected-access

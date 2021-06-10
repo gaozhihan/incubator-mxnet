@@ -230,7 +230,7 @@ class PadProp : public OperatorProperty {
       }
     }
     mxnet::TShape oshape = dshape;
-    for (size_t i = 0; i < dshape.ndim(); ++i) {
+    for (int i = 0; i < dshape.ndim(); ++i) {
       oshape[i] =
           param_.pad_width[2 * i] + param_.pad_width[2 * i + 1] + dshape[i];
     }
@@ -255,7 +255,7 @@ class PadProp : public OperatorProperty {
 
   Operator *CreateOperator(Context ctx) const override {
     LOG(FATAL) << "Not Implemented.";
-    return NULL;
+    return nullptr;
   }
 
   Operator *CreateOperatorEx(Context ctx, mxnet::ShapeVector *in_shape,

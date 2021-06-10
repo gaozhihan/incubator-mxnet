@@ -27,11 +27,10 @@
 #include <dmlc/logging.h>
 #include <mxnet/tensor_blob.h>
 #include "../../src/operator/nn/batch_norm-inl.h"
-#include "../../src/operator/batch_norm_v1-inl.h"
 #include "../../src/operator/operator_common.h"
 #include "./test_legacy_op.h"
 #include "./test_core_op.h"
-#include "executor/exec_pass.h"
+#include "imperative/exec_pass.h"
 
 using namespace mxnet;
 
@@ -278,7 +277,7 @@ class BatchNormValidator : public test::op::Validator<DType, AccReal> {
   typedef test::op::Validator<DType, AccReal> Super;
 
   /*! \brief Only static functions in this class */
-  BatchNormValidator() = delete;
+  BatchNormValidator() = delete;  // NOLINT
 
   /*! \brief Check batch norm output - 1D */
   static void checkBatchNorm1D(const TBlob *blob) {
@@ -567,10 +566,9 @@ static const test::op::kwargs_t nfs_ugs_kwargs_nocudnn = {
 
 #if !DISABLE_VALIDATION
 static bool isUGS(const test::op::kwargs_t& kwargs) {
-  for (test::op::kwargs_t::const_iterator i = kwargs.begin(),
-         e = kwargs.end(); i != e; ++i) {
-    if (!i->first.compare("use_global_stats")) {
-      return i->second.compare("True") == 0;
+  for (const auto & kwarg : kwargs) {
+    if (!kwarg.first.compare("use_global_stats")) {
+      return kwarg.second.compare("True") == 0;
     }
   }
   return false;
@@ -710,12 +708,12 @@ static constexpr size_t CYCLE_COUNT = 3;
 
 template<typename OperatorProp1, typename OperatorProp2, typename OperatorExecutor>
 static test::op::OpInfoPair<OperatorProp1, OperatorProp2, OperatorExecutor> testForwardAndBackward(
-  const bool isGPU1,
-  const bool isGPU2,
-  const mxnet::TShape &inputShape,
-  const test::op::kwargs_t& kwargs,
-  const size_t count = 1,
-  const size_t cycleCount = CYCLE_COUNT) {
+    const bool isGPU1,
+    const bool isGPU2,
+    const mxnet::TShape &inputShape,
+    const test::op::kwargs_t& kwargs,
+    const size_t count = 1,
+    const size_t cycleCount = CYCLE_COUNT) {
   test::op::OpInfo<OperatorProp1, OperatorExecutor> info_1 =
     TestBatchNormOperatorForward<OperatorProp1, OperatorExecutor>(isGPU1, inputShape,
                                                                   kwargs, count);
@@ -726,8 +724,8 @@ static test::op::OpInfoPair<OperatorProp1, OperatorProp2, OperatorExecutor> test
 
   size_t thisCount = 0;
 
-  typedef typename OperatorExecutor::DataType DType;
-  typedef typename OperatorExecutor::AccRealType AccReal;
+  using DType = typename OperatorExecutor::DataType;
+  using AccReal = typename OperatorExecutor::AccRealType;
 
   do {
     const bool isLast = thisCount == cycleCount - 1;
@@ -1014,14 +1012,14 @@ TEST(BATCH_NORM, TestTiming_2D) {
   }
 MSHADOW_REAL_TYPE_SWITCH_EX(
   mshadow::kFloat32, DType, AccReal, {
-#if MXNET_USE_MKLDNN
+#if MXNET_USE_ONEDNN == 1
   // MKL
   timingTest<BatchNormCoreOpProp, BNOperatorExecutor<DType, AccReal>>(
     "MKL BatchNormProp<cpu> 2D",
     false, false,
     blank_kwargs_nocudnn,
     2, THISCOUNT);
-#endif
+#endif  // MXNET_USE_ONEDNN == 1
   // CPU
   test::ScopeSet<volatile bool> disableMKL(&mxnet::op::batchnorm::disable_mkl, true);
   timingTest<BatchNormCoreOpProp, BNOperatorExecutor<DType, AccReal>>(
@@ -1266,7 +1264,7 @@ static void testSaveAndLoad(const std::vector<size_t>& dims,
   ChannelAxisTestData<DType> data;
   data.channel_data_ = inputChannelData;
 
-  mxnet::TShape shape(dims.size());
+  mxnet::TShape shape(dims.size(), -1);
   for (size_t i = 0, n = dims.size(); i < n; ++i) {
     shape[i] = index_t(dims[i]);
   }
@@ -1289,8 +1287,8 @@ static void testSaveAndLoad(const std::vector<size_t>& dims,
 TEST(BATCH_NORM, TestChannelAxisSaveAndLoad) {
   std::cout << std::endl << std::flush;
 
-  typedef float DType;
-  typedef float AccReal;
+  using DType = float;
+  using AccReal = float;
 
   const std::vector<std::vector<DType>> myData =
     { { 1.0f, 1.0f, 1.0f, 1.0f },
@@ -1322,7 +1320,7 @@ static mxnet::TShape MakeShape(const std::vector<index_t>& shape,
   }
   CHECK_LT(channelAxis, shape.size() + 1);
   const index_t dim = index_t(shape.size()) + 1;
-  mxnet::TShape newShape(dim);
+  mxnet::TShape newShape(dim, -1);
   for (size_t x = 0; x < static_cast<size_t>(channelAxis); ++x) {
     newShape[x] = index_t(shape[x]);
   }
@@ -1347,8 +1345,8 @@ static void runChannelAxisTest(
   const size_t numberOfPasses = 5
 
 ) {
-  typedef float DType;
-  typedef float AccReal;
+  using DType = float;
+  using AccReal = float;
 
   size_t spatialSize = 1;
   for (size_t x = 1, n = shape.size(); x < n; ++x) {

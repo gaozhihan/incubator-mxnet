@@ -15,10 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# pylint: disable=unused-import
+# pylint: disable=unused-import, too-many-lines
 """Read images and perform augmentations for object detection."""
 
-from __future__ import absolute_import, print_function
 
 import json
 import logging
@@ -34,6 +33,8 @@ from .. import io
 from .image import RandomOrderAug, ColorJitterAug, LightingAug, ColorNormalizeAug
 from .image import ResizeAug, ForceResizeAug, CastAug, HueJitterAug, RandomGrayAug
 from .image import fixed_crop, ImageIter, Augmenter
+from ..util import is_np_array
+from .. import numpy as _mx_np  # pylint: disable=reimported
 
 
 class DetAugmenter(object):
@@ -701,7 +702,7 @@ class ImageDetIter(ImageIter):
 
     def _estimate_label_shape(self):
         """Helper function to estimate label shape"""
-        max_count = 0
+        max_count, label = 0, None
         self.reset()
         try:
             while True:
@@ -711,7 +712,7 @@ class ImageDetIter(ImageIter):
         except StopIteration:
             pass
         self.reset()
-        return (max_count, label.shape[1])
+        return (max_count, label.shape[1] if label is not None else 5)
 
     def _parse_label(self, label):
         """Helper function to parse object detection label.
@@ -762,6 +763,7 @@ class ImageDetIter(ImageIter):
         """Override the helper function for batchifying data"""
         i = start
         batch_size = self.batch_size
+        array_fn = _mx_np.array if is_np_array() else nd.array
         try:
             while i < batch_size:
                 label, s = self.next_sample()
@@ -778,7 +780,7 @@ class ImageDetIter(ImageIter):
                     assert i < batch_size, 'Batch size must be multiples of augmenter output length'
                     batch_data[i] = self.postprocess_data(datum)
                     num_object = label.shape[0]
-                    batch_label[i][0:num_object] = nd.array(label)
+                    batch_label[i][0:num_object] = array_fn(label)
                     if num_object < batch_label[i].shape[0]:
                         batch_label[i][num_object:] = -1
                     i += 1
@@ -801,8 +803,14 @@ class ImageDetIter(ImageIter):
             batch_label = self._cache_label
             i = self._cache_idx
         else:
-            batch_data = nd.zeros((batch_size, c, h, w))
-            batch_label = nd.empty(self.provide_label[0][1])
+            if is_np_array():
+                zeros_fn = _mx_np.zeros
+                empty_fn = _mx_np.empty
+            else:
+                zeros_fn = nd.zeros
+                empty_fn = nd.empty
+            batch_data = zeros_fn((batch_size, c, h, w))
+            batch_label = empty_fn(self.provide_label[0][1])
             batch_label[:] = -1
             i = self._batchify(batch_data, batch_label)
         # calculate the padding
@@ -812,20 +820,20 @@ class ImageDetIter(ImageIter):
             if self.last_batch_handle == 'discard':
                 raise StopIteration
             # if the option is 'roll_over', throw StopIteration and cache the data
-            elif self.last_batch_handle == 'roll_over' and \
+            if self.last_batch_handle == 'roll_over' and \
                 self._cache_data is None:
                 self._cache_data = batch_data
                 self._cache_label = batch_label
                 self._cache_idx = i
                 raise StopIteration
+
+            _ = self._batchify(batch_data, batch_label, i)
+            if self.last_batch_handle == 'pad':
+                self._allow_read = False
             else:
-                _ = self._batchify(batch_data, batch_label, i)
-                if self.last_batch_handle == 'pad':
-                    self._allow_read = False
-                else:
-                    self._cache_data = None
-                    self._cache_label = None
-                    self._cache_idx = None
+                self._cache_data = None
+                self._cache_label = None
+                self._cache_idx = None
 
         return io.DataBatch([batch_data], [batch_label], pad=pad)
 

@@ -60,7 +60,7 @@ static bool UpSamplingShape(const nnvm::NodeAttrs& attrs,
     CHECK_EQ(in_shape->size(), 2U) << "Input:[data, weight]";
     CHECK_EQ(dshape.ndim(), 4U) << \
       "UpSamplingBilinear: Input data should be 4D in (batch, channel, y, x)";
-    if (dshape.ndim() ==  0) return false;
+    if (!shape_is_known(dshape)) return false;
     int kernel = 2 * param_.scale - param_.scale % 2;
     SHAPE_ASSIGN_CHECK(*in_shape,
         up_enum::kWeight,
@@ -77,6 +77,7 @@ static bool UpSamplingShape(const nnvm::NodeAttrs& attrs,
 static inline std::vector<std::string> ListArguments(const UpSamplingParam& param) {
   if (param.sample_type == up_enum::kNearest) {
     std::vector<std::string> ret;
+    ret.reserve(param.num_args);
     for (int i = 0; i < param.num_args; ++i) {
       ret.push_back(std::string("arg") + std::to_string(i));
     }
@@ -106,7 +107,7 @@ static bool UpSamplingType(const nnvm::NodeAttrs& attrs,
 
 struct UpSamplingGrad {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     const UpSamplingParam& param_ = nnvm::get<UpSamplingParam>(n->attrs.parsed);
     std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
@@ -121,7 +122,56 @@ struct UpSamplingGrad {
 DMLC_REGISTER_PARAMETER(UpSamplingParam);
 
 NNVM_REGISTER_OP(UpSampling)
-.describe("Performs nearest neighbor/bilinear up sampling to inputs.")
+.describe(R"code(Upsamples the given input data.
+
+Two algorithms (``sample_type``) are available for upsampling:
+
+- Nearest Neighbor
+- Bilinear
+
+**Nearest Neighbor Upsampling**
+
+Input data is expected to be NCHW.
+
+Example::
+
+  x = [[[[1. 1. 1.]
+         [1. 1. 1.]
+         [1. 1. 1.]]]]
+
+  UpSampling(x, scale=2, sample_type='nearest') = [[[[1. 1. 1. 1. 1. 1.]
+                                                     [1. 1. 1. 1. 1. 1.]
+                                                     [1. 1. 1. 1. 1. 1.]
+                                                     [1. 1. 1. 1. 1. 1.]
+                                                     [1. 1. 1. 1. 1. 1.]
+                                                     [1. 1. 1. 1. 1. 1.]]]]
+
+**Bilinear Upsampling**
+
+Uses `deconvolution` algorithm under the hood. You need provide both input data and the kernel.
+
+Input data is expected to be NCHW.
+
+`num_filter` is expected to be same as the number of channels.
+
+Example::
+
+  x = [[[[1. 1. 1.]
+         [1. 1. 1.]
+         [1. 1. 1.]]]]
+
+  w = [[[[1. 1. 1. 1.]
+         [1. 1. 1. 1.]
+         [1. 1. 1. 1.]
+         [1. 1. 1. 1.]]]]
+  
+  UpSampling(x, w, scale=2, sample_type='bilinear', num_filter=1) = [[[[1. 2. 2. 2. 2. 1.]
+                                                                       [2. 4. 4. 4. 4. 2.]
+                                                                       [2. 4. 4. 4. 4. 2.]
+                                                                       [2. 4. 4. 4. 4. 2.]
+                                                                       [2. 4. 4. 4. 4. 2.]
+                                                                       [1. 2. 2. 2. 2. 1.]]]]
+)code" ADD_FILELINE)
 .set_num_inputs([](const NodeAttrs& attrs) {
   const UpSamplingParam& params = nnvm::get<UpSamplingParam>(attrs.parsed);
   return params.sample_type == up_enum::kNearest ? params.num_args : 2;
@@ -146,13 +196,15 @@ NNVM_REGISTER_OP(UpSampling)
     return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
   }
 })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<FCompute>("FCompute<cpu>", UpSamplingCompute<cpu>)
 .set_attr<nnvm::FGradient>("FGradient", UpSamplingGrad{"_backward_UpSampling"})
 .set_attr<std::string>("key_var_num_args", "num_args")
-.add_argument("data", "NDArray-or-Symbol[]", "Array of tensors to upsample")
+.add_argument("data", "NDArray-or-Symbol[]", "Array of tensors to upsample. "
+              "For bilinear upsampling, there should be 2 inputs - 1 data and 1 weight.")
 .add_arguments(UpSamplingParam::__FIELDS__())
 .set_attr<nnvm::FSetInputVarAttrOnCompose>("FSetInputVarAttrOnCompose",
-    [](const nnvm::NodeAttrs& attrs, nnvm::NodePtr var, const int index) {
+    [](const nnvm::NodeAttrs& attrs, nnvm::ObjectPtr var, const int index) {
       if (var->attrs.dict.find("__init__") != var->attrs.dict.end()) return;
       if (index == 1) {
         var->attrs.dict["__init__"] = "[\"bilinear\", {}]";
@@ -160,6 +212,14 @@ NNVM_REGISTER_OP(UpSampling)
     });
 
 NNVM_REGISTER_OP(_backward_UpSampling)
+.set_num_inputs([](const NodeAttrs& attrs) {
+  const UpSamplingParam& param_ = nnvm::get<UpSamplingParam>(attrs.parsed);
+  if (param_.sample_type != up_enum::kNearest) {
+    return 3;
+  } else {
+    return 1;
+  }
+})
 .set_num_outputs([](const NodeAttrs& attrs) {
   const UpSamplingParam& params = nnvm::get<UpSamplingParam>(attrs.parsed);
   return params.sample_type == up_enum::kNearest ? params.num_args : 2;

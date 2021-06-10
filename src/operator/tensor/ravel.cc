@@ -45,6 +45,7 @@ Examples::
 .set_attr_parser(ParamParser<RavelParam>)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs)
   { return std::vector<ResourceRequest>{ResourceRequest::kTempSpace}; })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<nnvm::FListInputNames>("FListInputNames", [](const NodeAttrs& attrs)
   { return std::vector<std::string>{"data"}; } )
 .set_attr<mxnet::FInferShape>("FInferShape", RavelOpShape)
@@ -61,8 +62,16 @@ NNVM_REGISTER_OP(_unravel_index)
 Examples::
 
    A = [22,41,37]
-   unravel(A, shape=(7,6)) = [[3,6,6],[4,5,1]]
-   unravel(A, shape=(-1,6)) = [[3,6,6],[4,5,1]]
+   unravel_index(A, shape=(7,6)) = [[3,6,6],
+                                    [4,5,1]]
+   unravel_index(A, shape=(-1,6)) = [[3,6,6],
+                                     [4,5,1]]
+
+   B = [[22,41,37],[10,11,15]]
+   unravel_index(B, shape=(7,6)) = [[[3,6,6],[1,1,2]],
+                                    [[4,5,1],[4,5,3]]]
+   unravel_index(B, shape=(-1,6)) = [[[3,6,6],[1,1,2]],
+                                     [[4,5,1],[4,5,3]]]
 
 )code" ADD_FILELINE)
 .set_num_inputs(1)
@@ -70,6 +79,7 @@ Examples::
 .set_attr_parser(ParamParser<RavelParam>)
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& attrs)
   { return std::vector<ResourceRequest>{ResourceRequest::kTempSpace}; })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<nnvm::FListInputNames>("FListInputNames", [](const NodeAttrs& attrs)
   { return std::vector<std::string>{"data"}; } )
 .set_attr<mxnet::FInferShape>("FInferShape", UnravelOpShape)

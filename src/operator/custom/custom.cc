@@ -43,33 +43,27 @@ struct CustomParam {
 
 /*! \brief allocate ndarrays from existing ndarrays
  */
-inline void AllocateNDArrayCopy(NDArray** nd,
-                                const std::vector<NDArray>& inputs,
-                                size_t idx, int dev_id) {
+inline NDArray *AllocateNDArrayCopy(const NDArray &input, int dev_id) {
   std::vector<TBlob> aux;
-  NDArrayStorageType stype = inputs[idx].storage_type();
+  NDArrayStorageType stype = input.storage_type();
   switch (stype) {
     case kUndefinedStorage:
     case kDefaultStorage:
-      *nd = new NDArray(inputs[idx].data(), dev_id);
-      break;
+      return new NDArray(input.data(), dev_id);
     case kRowSparseStorage:
-      aux.push_back(inputs[idx].aux_data(rowsparse::kIdx));
-      *nd = new NDArray(stype, inputs[idx].shape(), inputs[idx].data(), aux,
-                        dev_id);
+      aux.push_back(input.aux_data(rowsparse::kIdx));
       break;
     case kCSRStorage:
-      aux.push_back(inputs[idx].aux_data(csr::kIndPtr));
-      aux.push_back(inputs[idx].aux_data(csr::kIdx));
-      *nd = new NDArray(stype, inputs[idx].shape(), inputs[idx].data(), aux,
-                        dev_id);
+      aux.push_back(input.aux_data(csr::kIndPtr));
+      aux.push_back(input.aux_data(csr::kIdx));
       break;
   }
+  return new NDArray(stype, input.shape(), input.data(), aux, dev_id);
 }
 
 template<CustomOpPropCallbacks Type>
 std::vector<std::string> List(const NodeAttrs& attrs) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
   char ** args = nullptr;
   CHECK(reinterpret_cast<CustomOpListFunc>(
     params.info->callbacks[Type])(
@@ -125,20 +119,24 @@ void AttrParser(NodeAttrs* attrs) {
 bool InferShape(const NodeAttrs& attrs,
                 mxnet::ShapeVector *in_shape,
                 mxnet::ShapeVector *out_shape) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
 
   size_t total = params.num_args + params.num_outs + params.num_auxs;
-  std::vector<uint32_t*> shapes(total);
+  std::vector<int*> shapes(total);
   std::vector<int> ndims(total);
   size_t buff_size = 0;
-  for (const auto& i : *in_shape) buff_size += i.ndim();
-  std::vector<uint32_t> buff(buff_size);
-  uint32_t *ptr = buff.data();
+  for (const auto& i : *in_shape) {
+    if (i.ndim() > 0) {
+      buff_size += i.ndim();
+    }
+  }
+  std::vector<int> buff(buff_size);
+  int *ptr = buff.data();
   for (size_t i = 0; i < in_shape->size(); ++i) {
     shapes[i] = ptr;
     ndims[i] = (*in_shape)[i].ndim();
-    for (size_t j = 0; j < (*in_shape)[i].ndim(); ++j, ++ptr) {
-      *ptr = static_cast<uint32_t>((*in_shape)[i][j]);
+    for (int j = 0; j < (*in_shape)[i].ndim(); ++j, ++ptr) {
+      *ptr = (*in_shape)[i][j];
     }
   }
 
@@ -168,7 +166,7 @@ bool InferShape(const NodeAttrs& attrs,
 bool InferType(const NodeAttrs& attrs,
                std::vector<int> *in_type,
                std::vector<int> *out_type) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
 
   if (params.info->num_callbacks <= kCustomOpPropInferType) {
     return ElemwiseAttr<int, type_is_none, type_assign, true, type_string>(
@@ -205,11 +203,11 @@ bool InferType(const NodeAttrs& attrs,
 }
 
 std::vector<nnvm::NodeEntry> Gradient(
-    const nnvm::NodePtr& n,
+    const nnvm::ObjectPtr& n,
     const std::vector<nnvm::NodeEntry>& out_grads) {
-  const CustomParam& params = nnvm::get<CustomParam>(n->attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(n->attrs.parsed);
 
-  nnvm::NodePtr g = nnvm::Node::Create();
+  nnvm::ObjectPtr g = nnvm::Node::Create();
   g->attrs.op = nnvm::Op::Get("_backward_Custom");
   g->attrs.name = n->attrs.name;
   g->attrs.parsed = params;
@@ -217,10 +215,10 @@ std::vector<nnvm::NodeEntry> Gradient(
 
   g->inputs.reserve(params.bwd_idx.size());
   for (const int& t : params.bwd_idx) {
-    size_t i = static_cast<size_t>(t);
+    auto i = static_cast<size_t>(t);
     if (i >= params.num_outs + params.num_args) {
-      uint32_t idx = static_cast<uint32_t>(i-params.num_outs-params.num_args);
-      g->inputs.push_back(nnvm::NodeEntry{n, idx, 0});
+      auto idx = static_cast<uint32_t>(i-params.num_outs-params.num_args);
+      g->inputs.emplace_back(n, idx, 0);
     } else if (i >= params.num_outs) {
       g->inputs.push_back(n->inputs[i-params.num_outs]);
     } else {
@@ -234,14 +232,14 @@ std::vector<nnvm::NodeEntry> Gradient(
 
   std::vector<nnvm::NodeEntry> ret;
   for (size_t i = 0; i < params.num_args; ++i) {
-    ret.emplace_back(nnvm::NodeEntry{g, static_cast<uint32_t>(i), 0});
+    ret.emplace_back(g, static_cast<uint32_t>(i), 0);
   }
   if (params.num_auxs) {
-    nnvm::NodePtr ng = nnvm::Node::Create();
+    nnvm::ObjectPtr ng = nnvm::Node::Create();
     ng->attrs.op = nnvm::Op::Get("_NoGradient");
     ng->attrs.name = "NoGradient";
     for (size_t i = 0; i < params.num_auxs; ++i) {
-      ret.emplace_back(nnvm::NodeEntry{ng, 0, 0});
+      ret.emplace_back(ng, 0, 0);
     }
   }
 
@@ -252,7 +250,7 @@ std::vector<nnvm::NodeEntry> Gradient(
 OpStatePtr CreateState(const NodeAttrs& attrs, Context ctx,
                        const mxnet::ShapeVector& in_shape,
                        const std::vector<int>& in_type) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
 
   std::vector<uint32_t*> shapes(in_shape.size());
   std::vector<int> ndims(in_shape.size());
@@ -263,7 +261,7 @@ OpStatePtr CreateState(const NodeAttrs& attrs, Context ctx,
   for (size_t i = 0; i < in_shape.size(); ++i) {
     shapes[i] = ptr;
     ndims[i] = in_shape[i].ndim();
-    for (size_t j = 0; j < in_shape[i].ndim(); ++j, ++ptr) {
+    for (int j = 0; j < in_shape[i].ndim(); ++j, ++ptr) {
       *ptr = static_cast<uint32_t>(in_shape[i][j]);
     }
   }
@@ -291,7 +289,7 @@ void ForwardEx(const OpStatePtr& state, const OpContext& ctx,
                const std::vector<NDArray>& inputs,
                const std::vector<OpReqType>& req,
                const std::vector<NDArray>& outputs) {
-  const CustomParam& params = state.get_state<CustomParam>();
+  const auto& params = state.get_state<CustomParam>();
   std::vector<void*> ptrs;
   // Tags are provided to the callback to provide the frontend
   std::vector<int> tags;
@@ -307,25 +305,21 @@ void ForwardEx(const OpStatePtr& state, const OpContext& ctx,
   auto dev_id = ctx.run_ctx.ctx.dev_id;
 
   for (size_t i = 0; i < params.num_args; ++i) {
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, inputs, i, dev_id);
+    auto *nd = AllocateNDArrayCopy(inputs[i], dev_id);
     cpys.push_back(*nd);
     ptrs.push_back(reinterpret_cast<void*>(nd));
     tags.push_back(0);
   }
 
   for (size_t i = 0; i < params.num_outs; ++i) {
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, outputs, i, dev_id);
+    auto *nd = AllocateNDArrayCopy(outputs[i], dev_id);
     cpys.push_back(*nd);
     ptrs.push_back(reinterpret_cast<void*>(nd));
     tags.push_back(1);
   }
 
   for (size_t i = 0; i < params.num_auxs; ++i) {
-    size_t idx = i + params.num_args;
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, inputs, idx, dev_id);
+    auto *nd = AllocateNDArrayCopy(inputs[i + params.num_args], dev_id);
     cpys.push_back(*nd);
     ptrs.push_back(reinterpret_cast<void*>(nd));
     tags.push_back(4);
@@ -341,14 +335,14 @@ void ForwardEx(const OpStatePtr& state, const OpContext& ctx,
             static_cast<int>(ctx.is_train),
             params.info->contexts[kCustomOpForward]));
       },
-      ctx, false, ctx.is_train, cpys, tags, output_tags, outputs);
+      ctx, false, ctx.is_train, cpys, tags, output_tags, outputs, params.op_type);
 }
 
 void BackwardEx(const OpStatePtr& state, const OpContext& ctx,
                 const std::vector<NDArray>& inputs,
                 const std::vector<OpReqType>& req,
                 const std::vector<NDArray>& outputs) {
-  const CustomParam& params = state.get_state<CustomParam>();
+  const auto& params = state.get_state<CustomParam>();
 
   size_t total = 2 * params.num_args + 2 * params.num_outs + params.num_auxs;
   std::vector<void*> ptrs(params.num_args + 2 * params.num_outs, nullptr);
@@ -377,8 +371,7 @@ void BackwardEx(const OpStatePtr& state, const OpContext& ctx,
 
 
   for (size_t i = 0; i < params.bwd_idx.size(); ++i) {
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, inputs, i, dev_id);
+    auto *nd = AllocateNDArrayCopy(inputs[i], dev_id);
     cpys.push_back(*nd);
     ptrs[params.bwd_idx[i]] = reinterpret_cast<void*>(nd);
   }
@@ -389,9 +382,8 @@ void BackwardEx(const OpStatePtr& state, const OpContext& ctx,
       ptr = reinterpret_cast<void*>(nd);
     }
   }
-  for (size_t i = 0; i < outputs.size(); ++i) {
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, outputs, i, dev_id);
+  for (auto& output : outputs) {
+    auto *nd = AllocateNDArrayCopy(output, dev_id);
     cpys.push_back(*nd);
     ptrs.push_back(reinterpret_cast<void*>(nd));
     tags.push_back(2);
@@ -399,8 +391,7 @@ void BackwardEx(const OpStatePtr& state, const OpContext& ctx,
 
   for (size_t i = 0; i < params.num_auxs; ++i) {
     size_t idx = inputs.size() - params.num_auxs + i;
-    NDArray* nd;
-    AllocateNDArrayCopy(&nd, inputs, idx, dev_id);
+    auto *nd = AllocateNDArrayCopy(inputs[idx], dev_id);
     cpys.push_back(*nd);
     ptrs.push_back(reinterpret_cast<void*>(nd));
     tags.push_back(4);
@@ -411,7 +402,7 @@ void BackwardEx(const OpStatePtr& state, const OpContext& ctx,
         ptrs.size(), const_cast<void**>(ptrs.data()), const_cast<int*>(tags.data()),
         reinterpret_cast<const int*>(req.data()), static_cast<int>(ctx.is_train),
         params.info->contexts[kCustomOpBackward]));
-    }, ctx, false, ctx.is_train, cpys, tags, output_tags, outputs);
+    }, ctx, false, ctx.is_train, cpys, tags, output_tags, outputs, "_backward_" + params.op_type);
 }
 
 // infer storage backward function for custom op which assigns kDefaultStorage for
@@ -421,7 +412,7 @@ inline bool BackwardInferStorageType(const nnvm::NodeAttrs& attrs,
                                      DispatchMode* dispatch_mode,
                                      std::vector<int>* iattr,
                                      std::vector<int>* oattr) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
 
   if (params.info->num_callbacks <= kCustomOpPropBackwardInferStorageType) {
     for (size_t i = 0; i < iattr->size(); i++) {
@@ -487,7 +478,7 @@ inline bool BackwardInferStorageType(const nnvm::NodeAttrs& attrs,
 inline bool InferStorageType(const nnvm::NodeAttrs& attrs, const int dev_mask,
                              DispatchMode* dispatch_mode,
                              std::vector<int>* iattr, std::vector<int>* oattr) {
-  const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+  const auto& params = nnvm::get<CustomParam>(attrs.parsed);
 
   if (params.info->num_callbacks <= kCustomOpPropInferStorageType) {
     for (size_t i = 0; i < iattr->size(); i++) {
@@ -533,19 +524,20 @@ inline bool InferStorageType(const nnvm::NodeAttrs& attrs, const int dev_mask,
 }
 
 NNVM_REGISTER_OP(Custom)
+.add_alias("_npi_Custom")
 .describe(R"code(Apply a custom operator implemented in a frontend language (like Python).
 
 Custom operators should override required methods like `forward` and `backward`.
 The custom operator must be registered before it can be used.
-Please check the tutorial here: http://mxnet.io/faq/new_op.html.
+Please check the tutorial here: https://mxnet.incubator.apache.org/api/faq/new_op
 
 )code" ADD_FILELINE)
 .set_num_inputs([](const NodeAttrs& attrs){
-    const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+    const auto& params = nnvm::get<CustomParam>(attrs.parsed);
     return params.num_args + params.num_auxs;
   })
 .set_num_outputs([](const NodeAttrs& attrs){
-    const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+    const auto& params = nnvm::get<CustomParam>(attrs.parsed);
     return params.num_outs;
   })
 .set_attr_parser(AttrParser)
@@ -559,7 +551,7 @@ Please check the tutorial here: http://mxnet.io/faq/new_op.html.
   })
 .set_attr<nnvm::FListOutputNames>("FListOutputNames", List<kCustomOpPropListOutputs>)
 .set_attr<nnvm::FMutateInputs>("FMutateInputs", [](const NodeAttrs& attrs) {
-    const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+    const auto& params = nnvm::get<CustomParam>(attrs.parsed);
     std::vector<uint32_t> ret;
     for (size_t i = 0; i < params.num_auxs; ++i) ret.push_back(i+params.num_args);
     return ret;
@@ -580,11 +572,11 @@ Please check the tutorial here: http://mxnet.io/faq/new_op.html.
 
 NNVM_REGISTER_OP(_backward_Custom)
 .set_num_inputs([](const NodeAttrs& attrs){
-    const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
-    return params.bwd_idx.size();
+    const auto& params = nnvm::get<CustomParam>(attrs.parsed);
+    return params.bwd_idx.size() + params.num_auxs;
   })
 .set_num_outputs([](const NodeAttrs& attrs){
-    const CustomParam& params = nnvm::get<CustomParam>(attrs.parsed);
+    const auto& params = nnvm::get<CustomParam>(attrs.parsed);
     return params.num_args;
   })
 .set_attr<bool>("TIsLayerOpBackward", true)

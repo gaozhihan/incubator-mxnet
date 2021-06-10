@@ -27,6 +27,7 @@
 
 #include <mxnet/operator_util.h>
 #include <vector>
+#include <string>
 #include <algorithm>
 #include <utility>
 #include <type_traits>
@@ -43,23 +44,28 @@
 #include <thrust/device_vector.h>
 #endif
 
+#ifdef __CUDACC__
+#include "./pseudo2DTranspose_op-inl.cuh"
+#endif
+
+
 namespace mxnet {
 namespace op {
 
 struct ReshapeParam : public dmlc::Parameter<ReshapeParam> {
   mxnet::TShape target_shape;
   bool keep_highest;
-  nnvm::Tuple<int> shape;
+  mxnet::Tuple<int> shape;
   bool reverse;
   DMLC_DECLARE_PARAMETER(ReshapeParam) {
     DMLC_DECLARE_FIELD(shape)
-    .set_default(nnvm::Tuple<int>())
+    .set_default(mxnet::Tuple<int>())
     .describe("The target shape");
     DMLC_DECLARE_FIELD(reverse)
     .set_default(false)
     .describe("If true then the special values are inferred from right to left");
     DMLC_DECLARE_FIELD(target_shape)
-    .set_default(mxnet::TShape())
+    .set_default(mxnet::TShape(0, -1))
     .describe("(Deprecated! Use ``shape`` instead.) "
               "Target new shape. One and only one dim can be 0, "
               "in which case it will be inferred from the rest of dims");
@@ -68,14 +74,21 @@ struct ReshapeParam : public dmlc::Parameter<ReshapeParam> {
               "If set to true, then the first dim in target_shape is ignored,"
               "and always fixed as input");
   }
+
+  bool operator==(const ReshapeParam &other) const {
+    return this->target_shape == other.target_shape &&
+           this->keep_highest == other.keep_highest &&
+           this->shape == other.shape &&
+           this->reverse == other.reverse;
+  }
 };
 
 template<typename IType>
-inline mxnet::TShape InferReshapeShape(const nnvm::Tuple<IType>& shape,
-                                const mxnet::TShape& dshape, bool reverse) {
+inline mxnet::TShape InferReshapeShape(const mxnet::Tuple<IType>& shape,
+                                       const mxnet::TShape& dshape, bool reverse) {
   std::vector<IType> dshape_vec;
   std::vector<IType> param_shape_vec(shape.begin(), shape.end());
-  for (index_t i = 0; i < dshape.ndim(); ++i) {
+  for (int i = 0; i < dshape.ndim(); ++i) {
     dshape_vec.push_back(dshape[i]);
   }
   std::vector<IType> tmp;
@@ -102,28 +115,31 @@ inline mxnet::TShape InferReshapeShape(const nnvm::Tuple<IType>& shape,
     } else if (proposed_dim == -2) {
       // copy all remaining dims from source
       while (src_idx < dshape_len) {
-        size_t dn = dshape_vec[src_idx++];
+        const int dn = dshape_vec[src_idx++];
         tmp.push_back(dn);
       }
     } else if (proposed_dim == -3) {
       // merge two dims from source
       CHECK_LT(src_idx, dshape_len-1);
-      size_t d1 = dshape_vec[src_idx++];
-      size_t d2 = dshape_vec[src_idx++];
-      size_t dn = d1 * d2;
-      tmp.push_back(dn);
+      const int d1 = dshape_vec[src_idx++];
+      const int d2 = dshape_vec[src_idx++];
+      if (!mxnet::dim_size_is_known(d1) || !mxnet::dim_size_is_known(d2)) {
+        tmp.push_back(-1);
+      } else {
+        tmp.push_back(d1 * d2);
+      }
     } else if (proposed_dim == -4) {
       // split the source dim s into two dims
       // read the left dim and then the right dim (either can be -1)
       CHECK_LT(i + 2, params_len);
       CHECK_LT(src_idx, dshape_len);
-      size_t d0 = dshape_vec[src_idx++];
+      const int d0 = dshape_vec[src_idx++];
       IType d1 = param_shape_vec[++i];
       IType d2 = param_shape_vec[++i];
       CHECK(d1 != -1 || d2 != -1) << "Split dims cannot both be -1.";
-      if (d1 == -1) d1 = d0 / d2;
-      if (d2 == -1) d2 = d0 / d1;
-      CHECK(d1 * d2 == static_cast<IType>(d0) || static_cast<IType>(d0) == IType(0)) <<
+      if (d1 == -1 && d0 >= 0) d1 = d0 / d2;  // d0 must be known to do this
+      if (d2 == -1 && d0 >= 0) d2 = d0 / d1;  // d0 must be known to do this
+      CHECK(d1 * d2 == static_cast<IType>(d0) || static_cast<IType>(d0) == IType(-1)) <<
         "Split dims " << d1 << ", " << d2 << " do not divide original dim " << d0;
       tmp.push_back(d1);
       tmp.push_back(d2);
@@ -135,12 +151,12 @@ inline mxnet::TShape InferReshapeShape(const nnvm::Tuple<IType>& shape,
   }
 
   if (inf_idx >= 0) {
-    if (dshape.Size() > 0) {
+    if (shape_is_known(dshape)) {
       IType new_size = 1;
       for (IType x : tmp) new_size *= x;
       tmp[inf_idx] = dshape.Size() / new_size;
     } else {
-      tmp[inf_idx] = 0;
+      tmp[inf_idx] = -1;
     }
   }
   if (reverse) {
@@ -153,24 +169,24 @@ inline mxnet::TShape InferReshapeShape(const nnvm::Tuple<IType>& shape,
 }
 
 inline bool ReverseReshapeInferShape(mxnet::TShape *in, const mxnet::TShape& out) {
-  if (in->Size() && out.Size()) {
+  if (shape_is_known(*in) && shape_is_known(out)) {
     return true;
-  } else if (!out.Size()) {
+  } else if (!shape_is_known(out)) {
     return false;
   } else {
     int zero_axis = -1;
-    int non_zero_prod = 1;
-    for (index_t i = 0; i < in->ndim(); i++) {
-      if ((*in)[i] == 0) {
+    int known_dim_size_prod = 1;
+    for (int i = 0; i < in->ndim(); i++) {
+      if (!mxnet::dim_size_is_known(*in, i)) {
         if (zero_axis != -1)
           return false;  // more than 1 zero found.
         else
           zero_axis = i;
       } else {
-        non_zero_prod *= (*in)[i];
+        known_dim_size_prod *= (*in)[i];
       }
     }
-    (*in)[zero_axis] = out.Size() / non_zero_prod;
+    (*in)[zero_axis] = out.Size() / known_dim_size_prod;
     return true;
   }
 }
@@ -182,11 +198,11 @@ inline bool ReshapeShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U) << "Input: [data]";
   CHECK_EQ(out_attrs->size(), 1U);
   mxnet::TShape &dshape = (*in_attrs)[0];
-  if (dshape.ndim() == 0) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
   mxnet::TShape oshape;
   if (param_.shape.ndim() != 0) {
     oshape = InferReshapeShape(param_.shape, dshape, param_.reverse);
-  } else if (param_.target_shape.ndim()) {
+  } else if (param_.target_shape.ndim() != -1) {
     LOG(INFO) << "Using target_shape will be deprecated.";
     oshape = param_.target_shape;
     int neg_count = 0;
@@ -195,7 +211,7 @@ inline bool ReshapeShape(const nnvm::NodeAttrs& attrs,
     if (param_.keep_highest) {
       oshape[0] = dshape[0];
     }
-    for (index_t i = start_idx; i < oshape.ndim(); ++i) {
+    for (int i = start_idx; i < oshape.ndim(); ++i) {
       if (oshape[i] == 0) {
         neg_count++;
         inf_idx = i;
@@ -206,13 +222,16 @@ inline bool ReshapeShape(const nnvm::NodeAttrs& attrs,
       oshape[inf_idx] = dshape.Size() / oshape.Size();
     }
   } else {
-    return (*out_attrs)[0].ndim() && ReverseReshapeInferShape(&(*in_attrs)[0], (*out_attrs)[0]);
+    return shape_is_known((*out_attrs)[0])
+           && ReverseReshapeInferShape(&(*in_attrs)[0], (*out_attrs)[0]);
   }
   ReverseReshapeInferShape(&dshape, oshape);
+#if 0
   CHECK_EQ(oshape.Size(), dshape.Size())
     << "Target shape size is different to source. "
     << "Target: " << oshape
     << "\nSource: " << dshape;
+#endif
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, oshape);
   return ReverseReshapeInferShape(&(*in_attrs)[0], (*out_attrs)[0]);
 }
@@ -223,9 +242,9 @@ inline bool FlattenShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U) << "Input: [data]";
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape &dshape = (*in_attrs)[0];
-  if (dshape.ndim() == 0) return false;
-  uint32_t target_dim = 1;
-  for (uint32_t i = 1; i < dshape.ndim(); ++i) {
+  if (!shape_is_known(dshape)) return false;
+  size_t target_dim = 1;
+  for (int i = 1; i < dshape.ndim(); ++i) {
     target_dim *= dshape[i];
   }
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, mshadow::Shape2(dshape[0], target_dim));
@@ -235,69 +254,287 @@ inline bool FlattenShape(const nnvm::NodeAttrs& attrs,
 struct TransposeParam : public dmlc::Parameter<TransposeParam> {
   mxnet::TShape axes;
   DMLC_DECLARE_PARAMETER(TransposeParam) {
-    DMLC_DECLARE_FIELD(axes).set_default(mxnet::TShape())
+    DMLC_DECLARE_FIELD(axes).set_default(mxnet::TShape(0, -1))
     .describe("Target axis order. By default the axes will be inverted.");
+  }
+
+  bool operator==(const TransposeParam &other) const {
+    return this->axes == other.axes;
   }
 };
 
-template<typename xpu>
-void TransposeImpl(RunContext ctx,
+
+/*!
+ * \brief This function performs transpose operation on a 2D matrix by utilizing the L1 cache
+ * \param in  input tensor
+ * \param out output tensor
+ * \param row shape of dim 0 of input
+ * \param col shape of dim 1 of input
+ * \tparam DType Data type
+ * \tparam is_addto
+ */
+template<typename DType, bool is_addto>
+MSHADOW_XINLINE void Transpose2D(const DType *in, DType *out, index_t row, index_t col) {
+  // ensure cache line hits and prevent cache miss for any configuration
+  // L1 cache size to be utilized = 32kb = 2^15
+  // Largest size of a single unit of any dtype <= 8 byte = 2^3
+  // Number of elements - (2^15/2^3) = 2^12
+  // Block-size - 2^6 v 2^6 (64 v 64)
+
+  // But we could leverage unrolling of for loops (for parallelization)
+  // Block-size - 2^5 v 2^5 (32 v 32) with potential 4 pragma for loop unrolled
+  // blocksize * blocksize * num_threads = cache_size / dtype_size
+  // Instead of explicit unroll, let compiler figure out optimal unroll factor
+  const index_t blocksize = 32;
+
+  // collapse 2 parallelizes 2 for loops
+  // inner 2 for loops aren't parallelized to prevent cache miss
+
+  // Microsoft Visual C++ compiler does not support omp collapse
+  #ifdef _MSC_VER
+    #pragma omp parallel for
+  #else
+    #pragma omp parallel for collapse(2)
+  #endif  // _MSC_VER
+
+  for (index_t i = 0; i < row; i += blocksize) {
+    for (index_t j = 0; j < col; j += blocksize) {
+      // transpose the block
+      for (index_t a = j; (a < blocksize + j) && (a < col); ++a) {
+        for (index_t b = i; (b < blocksize + i) && (b < row); ++b) {
+          if (!is_addto) {
+            out[a * row + b] = in[b * col + a];
+          } else {
+            out[a * row + b] += in[b * col + a];
+          }
+        }
+      }
+    }
+  }
+}
+
+inline bool IsIdentityTranspose(const TShape& axes) {
+  for (dim_t i = 0; i < axes.ndim(); i++) {
+    if (axes[i] != i) return false;
+  }
+  return true;
+}
+
+template<typename xpu, bool is_addto = false>
+bool TransposeCommonImpl(RunContext ctx,
                    const TBlob& src,
                    const TBlob& ret,
                    const mxnet::TShape& axes) {
+  // return true when running successfully, otherwise false
   using namespace mshadow;
   using namespace mshadow::expr;
   CHECK_EQ(src.type_flag_, ret.type_flag_);
+  // zero-size tensor, no need to compute
+  if (src.shape_.Size() == 0U) return true;
   Stream<xpu> *s = ctx.get_stream<xpu>();
+#ifdef __CUDACC__
+  // This transpose can be used only if there exist n and m such that:
+  // params = (0, ..., n-1, n+m, ..., params.size, n, ..., n+m-1)
+  // Example: (0, 2, 3, 1) or (0, 3, 1, 2), but not (0, 2, 1, 3).
+  if (isPseudo2DTranspose(axes)) {
+    MSHADOW_TYPE_SWITCH(ret.type_flag_, DType, {
+      transpose_pseudo2D<DType, is_addto>(ret, src, axes, s);
+    });
+    return true;
+  }
+#endif
+  // Special handle the identity case
+  if (IsIdentityTranspose(axes)) {
+    MSHADOW_TYPE_SWITCH(ret.type_flag_, DType, {
+      Tensor<xpu, 1, DType> in = src.get_with_shape<xpu, 1, DType>(mshadow::Shape1(src.Size()), s);
+      Tensor<xpu, 1, DType> out = ret.get_with_shape<xpu, 1, DType>(mshadow::Shape1(ret.Size()), s);
+      if (!is_addto) {
+        // Use memcpy to accelerate the speed
+        Copy(out, in, s);
+      } else {
+        mxnet_op::Kernel<mxnet_op::op_with_req<mshadow_op::identity, kAddTo>, xpu>::Launch(
+            s, ret.Size(), out.dptr_, in.dptr_);
+      }
+    });
+    return true;
+  }
+  // Handle the general transpose case
   MSHADOW_TYPE_SWITCH(ret.type_flag_, DType, {
     switch (axes.ndim()) {
-     case 0:
-      break;
-     case 1: {
-      Tensor<xpu, 1, DType> in = src.get<xpu, 1, DType>(s);
-      Tensor<xpu, 1, DType> out = ret.get<xpu, 1, DType>(s);
-      Copy(out, in, s);
-      break;
-     }
      case 2: {
-      mshadow::Tensor<xpu, 2, DType> in = src.FlatTo2D<xpu, DType>(s);
-      mshadow::Tensor<xpu, 2, DType> out = ret.FlatTo2D<xpu, DType>(s);
-      if (axes[0] == 1 && axes[1] == 0) {
-        out = in.T();
+      Tensor<xpu, 2, DType> in = src.get<xpu, 2, DType>(s);
+      Tensor<xpu, 2, DType> out = ret.get<xpu, 2, DType>(s);
+      if (ctx.get_ctx().dev_mask() == cpu::kDevMask) {
+        Transpose2D<DType, is_addto>(in.dptr_, out.dptr_, in.shape_[0], in.shape_[1]);
       } else {
-        Copy(out, in, s);
+        LOG(FATAL) << "Not Implemented. We should never reach here because the 2D case "
+                      "in GPU has been covered by transpose_pseudo2D."
+                      " Report an issue in Github.";
       }
       break;
      }
      case 3: {
       Tensor<xpu, 3, DType> in = src.get<xpu, 3, DType>(s);
       Tensor<xpu, 3, DType> out = ret.get<xpu, 3, DType>(s);
-      out = transpose(in, axes.get<3>());
+      if (!is_addto) {
+        out = transpose(in, axes.get<3>());
+      } else {
+        out += transpose(in, axes.get<3>());
+      }
       break;
      }
      case 4: {
       Tensor<xpu, 4, DType> in = src.get<xpu, 4, DType>(s);
       Tensor<xpu, 4, DType> out = ret.get<xpu, 4, DType>(s);
-      out = transpose(in, axes.get<4>());
+      if (!is_addto) {
+        out = transpose(in, axes.get<4>());
+      } else {
+        out += transpose(in, axes.get<4>());
+      }
       break;
      }
      case 5: {
       Tensor<xpu, 5, DType> in = src.get<xpu, 5, DType>(s);
       Tensor<xpu, 5, DType> out = ret.get<xpu, 5, DType>(s);
-      out = transpose(in, axes.get<5>());
+      if (!is_addto) {
+        out = transpose(in, axes.get<5>());
+      } else {
+        out += transpose(in, axes.get<5>());
+      }
       break;
      }
      case 6: {
       Tensor<xpu, 6, DType> in = src.get<xpu, 6, DType>(s);
       Tensor<xpu, 6, DType> out = ret.get<xpu, 6, DType>(s);
-      out = transpose(in, axes.get<6>());
+      if (!is_addto) {
+        out = transpose(in, axes.get<6>());
+      } else {
+        out += transpose(in, axes.get<6>());
+      }
       break;
      }
      default:
-      LOG(FATAL) << "Transpose support at most 6 dimensions";
+      // return false when dimensions > 6
+      return false;
       break;
     }
   });
+  return true;
+}
+
+template<typename xpu, bool is_addto = false>
+void TransposeImpl(RunContext ctx,
+                   const TBlob& src,
+                   const TBlob& ret,
+                   const mxnet::TShape& axes) {
+  CHECK_LE(axes.ndim(), 6) << "TransposeImpl supports at most 6 dimensions";
+  CHECK((TransposeCommonImpl<xpu, is_addto>(ctx, src, ret, axes))) <<
+    "Failed to execute TransposeImpl Operator";
+}
+
+template <bool is_addto>
+struct TransposeExKernel {
+  /*!
+   * \brief
+   * \param tid      global thread id
+   * \param out_data output data
+   * \param in_data  input data
+   * \param strides  input strides and output strides
+   * \param ndim     the number of dimension
+   */
+  template <typename DType>
+  MSHADOW_XINLINE static void Map(index_t tid,
+      DType *out_data,
+      const DType *in_data,
+      const dim_t *strides,
+      const int ndim
+      ) {
+    // tid is the index of input data
+    const dim_t* const out_strides = strides + ndim;
+    index_t k = tid;
+    index_t out_id = 0;
+    for (int i = 0; i < ndim; ++i) {
+      out_id += (k / strides[i]) * out_strides[i];
+      k %= strides[i];
+    }
+    if (is_addto)
+      out_data[out_id] += in_data[tid];
+    else
+      out_data[out_id] = in_data[tid];
+  }
+};
+
+template<typename xpu, bool is_addto = false>
+void TransposeExImpl(RunContext ctx,
+                   const TBlob& src,
+                   const TBlob& ret,
+                   const mxnet::TShape& axes,
+                   mshadow::Tensor<xpu, 1, dim_t>& strides_xpu
+                   ) {
+  /*
+   * If ndim <= 6, it is not necessary to allocate any space for `strides_xpu`
+   * If ndim > 6, `strides_xpu` should be allocated `ndim * 2` elements
+   */
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  if (TransposeCommonImpl<xpu, is_addto>(ctx, src, ret, axes)) return;
+  CHECK_GT(axes.ndim(), 6) <<
+    "Failed to execute TransposeExImpl when axes.ndim() <= 6";
+  Stream<xpu> *s = ctx.get_stream<xpu>();
+  MSHADOW_TYPE_SWITCH(ret.type_flag_, DType, {
+      CHECK_EQ(strides_xpu.MSize(), axes.ndim() * 2) << \
+        "If ndim > 6, `strides_xpu` should be allocated `ndim * 2` elements";
+
+      const mxnet::TShape &in_shape = src.shape_;
+      // strides: in_strides and out_strides
+      const int ndim = axes.ndim();
+      std::vector<dim_t> strides(ndim * 2);
+      // compute in_strides
+      strides[ndim - 1] = 1;
+      for (int i = ndim - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * in_shape[i + 1];
+      }
+      // compute out_strides
+      std::vector<dim_t> tmp_strides(ndim);
+      tmp_strides[ndim - 1] = 1;
+      for (int i = ndim - 2; i >= 0; --i) {
+        tmp_strides[i] = tmp_strides[i + 1] * in_shape[axes[i + 1]];
+      }
+      // reorder tmp_strides to out_strides
+      dim_t * const out_strides = &strides[ndim];
+      for (int i = 0; i < ndim; ++i) {
+        out_strides[axes[i]] = tmp_strides[i];
+      }
+      Shape<1> strides_shape;
+      strides_shape[0] = ndim * 2;
+      Tensor<cpu, 1, dim_t> strides_cpu(strides.data(), strides_shape);
+      // copy arguments into xpu context
+      Copy(strides_xpu, strides_cpu, s);
+      const DType *in = src.dptr<DType>();
+      DType *out = ret.dptr<DType>();
+      if (is_addto) {
+        mxnet_op::Kernel<TransposeExKernel<true>, xpu>::Launch(s,
+            in_shape.Size(), out, in, strides_xpu.dptr_, ndim);
+      } else {
+        mxnet_op::Kernel<TransposeExKernel<false>, xpu>::Launch(s,
+            in_shape.Size(), out, in, strides_xpu.dptr_, ndim);
+      }
+  });
+}
+
+template<typename xpu>
+mshadow::Tensor<xpu, 1, dim_t> GetTransposeExWorkspace(
+      const OpContext& ctx,
+      const mxnet::TShape& axes
+    ) {
+  if (axes.ndim() > 6) {
+    // allocate workspace when axes.ndim() > 6
+    mshadow::Shape<1> strides_shape;
+    strides_shape[0] = axes.ndim() * 2;
+    return ctx.requested[0].get_space_typed<xpu, 1, dim_t>(
+        strides_shape, ctx.get_stream<xpu>());
+  }
+  return {};
 }
 
 // matrix transpose
@@ -307,16 +544,30 @@ void Transpose(const nnvm::NodeAttrs& attrs,
                const std::vector<TBlob>& inputs,
                const std::vector<OpReqType>& req,
                const std::vector<TBlob>& outputs) {
+  if (req[0] == kNullOp) {
+    return;
+  }
   const TransposeParam& param = nnvm::get<TransposeParam>(attrs.parsed);
-  CHECK_EQ(req[0], kWriteTo) << "Transpose does not support inplace";
+  CHECK(req[0] == kWriteTo || req[0] == kAddTo)
+       << "Transpose only supports kNullOp, kWriteTo and kAddTo";
+  mxnet::TShape axes;
   if (param.axes.ndim() == 0) {
-    mxnet::TShape axes = mxnet::TShape(inputs[0].ndim());
-    for (index_t i = 0; i < axes.ndim(); ++i) {
+    axes = mxnet::TShape(inputs[0].ndim(), -1);
+    for (int i = 0; i < axes.ndim(); ++i) {
       axes[i] = axes.ndim() - 1 - i;
     }
-    TransposeImpl<xpu>(ctx.run_ctx, inputs[0], outputs[0], axes);
   } else {
-    TransposeImpl<xpu>(ctx.run_ctx, inputs[0], outputs[0], param.axes);
+    axes = common::CanonicalizeAxes(param.axes);
+  }
+
+  mshadow::Tensor<xpu, 1, dim_t> workspace =
+    GetTransposeExWorkspace<xpu>(ctx, axes);
+  if (req[0] == kAddTo) {
+    TransposeExImpl<xpu, true>(ctx.run_ctx, inputs[0], outputs[0],
+        axes, workspace);
+  } else {
+    TransposeExImpl<xpu, false>(ctx.run_ctx, inputs[0], outputs[0],
+        axes, workspace);
   }
 }
 
@@ -327,21 +578,33 @@ inline bool TransposeShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
   mxnet::TShape& shp = (*in_attrs)[0];
-  CHECK_LE(shp.ndim(), 6U) << "Transpose support at most 6 dimensions";
-  mxnet::TShape ret(shp.ndim());
+  mxnet::TShape& out_shp = (*out_attrs)[0];
+  if (!mxnet::ndim_is_known(shp) && !mxnet::ndim_is_known(out_shp))
+    return false;  // none of the shapes is known
+  if (out_shp.ndim() >= 0 && shp.ndim() >= 0)
+    CHECK_EQ(out_shp.ndim(), shp.ndim());
+  mxnet::TShape get(std::max(shp.ndim(), out_shp.ndim()), -1);
+  mxnet::TShape ret(std::max(shp.ndim(), out_shp.ndim()), -1);
   if (param.axes.ndim() == 0) {
-    for (index_t i = 0; i < shp.ndim(); ++i) {
+    for (int i = 0; i < shp.ndim(); ++i) {
       ret[i] = shp[shp.ndim()-1-i];
     }
+    for (int i = 0; i < out_shp.ndim(); ++i) {
+      get[shp.ndim()-1-i] = out_shp[i];
+    }
   } else {
-    CHECK_EQ(shp.ndim(), param.axes.ndim());
-    for (size_t i = 0; i < shp.ndim(); ++i) {
+    CHECK_EQ(std::max(shp.ndim(), out_shp.ndim()), param.axes.ndim());
+    for (int i = 0; i < shp.ndim(); ++i) {
       CHECK(param.axes[i] < static_cast<int64_t>(shp.ndim()));
       ret[i] = shp[param.axes[i]];
     }
+    for (int i = 0; i < out_shp.ndim(); ++i) {
+      get[param.axes[i]] = out_shp[i];
+    }
   }
+  SHAPE_ASSIGN_CHECK(*in_attrs, 0, get);
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, ret);
-  return true;
+  return shape_is_known(ret);
 }
 
 
@@ -353,6 +616,16 @@ struct ExpandDimParam : public dmlc::Parameter<ExpandDimParam> {
               "the input `NDArray`'s dimension is `ndim`, the range of "
               "the inserted axis is `[-ndim, ndim]`");
   }
+
+  bool operator==(const ExpandDimParam &other) const {
+    return this->axis == other.axis;
+  }
+
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream axis_s;
+    axis_s << axis;
+    (*dict)["axis"] = axis_s.str();
+  }
 };
 
 
@@ -362,15 +635,15 @@ inline bool ExpandDimShape(const nnvm::NodeAttrs& attrs,
   const ExpandDimParam& param = nnvm::get<ExpandDimParam>(attrs.parsed);
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
-  if (in_attrs->at(0).ndim() == 0U && out_attrs->at(0).ndim() == 0U) {
+  mxnet::TShape& ishape = (*in_attrs)[0];
+  mxnet::TShape& oshape = (*out_attrs)[0];
+  if (!mxnet::ndim_is_known(ishape) && !mxnet::ndim_is_known(oshape)) {
     return false;
   }
 
-  mxnet::TShape& ishape = (*in_attrs)[0];
-  mxnet::TShape& oshape = (*out_attrs)[0];
   int indim = ishape.ndim();
   bool unknown_ishape = false;
-  if (0 == indim) {
+  if (-1 == indim) {
     indim = oshape.ndim() - 1;
     unknown_ishape = true;
   }
@@ -382,27 +655,27 @@ inline bool ExpandDimShape(const nnvm::NodeAttrs& attrs,
   CHECK(axis >= 0 && axis <= indim)
       << "axis must be in the range [" << -indim << ", " << indim << "] ("
       << param.axis << " provided)";
-  mxnet::TShape ret(indim + 1);
+  mxnet::TShape ret(indim + 1, -1);
   for (int i = 0; i < axis; ++i) {
-    ret[i] = (unknown_ishape? 0 : ishape[i]);
+    ret[i] = (unknown_ishape? -1 : ishape[i]);
   }
   ret[axis] = 1;
   for (int i = axis+1; i < indim+1; ++i) {
-    ret[i] = (unknown_ishape? 0 : ishape[i-1]);
+    ret[i] = (unknown_ishape? -1 : ishape[i-1]);
   }
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, ret);
 
-  ret = mxnet::TShape(indim);
+  ret = mxnet::TShape(indim, -1);
   for (int i = 0; i < axis; ++i) ret[i] = oshape[i];
   for (int i = axis+1; i < indim+1; ++i) ret[i-1] = oshape[i];
   SHAPE_ASSIGN_CHECK(*in_attrs, 0, ret);
-  return true;
+  return shape_is_known(in_attrs->at(0)) && shape_is_known(out_attrs->at(0));
 }
 
 // Currently MKLDNN only supports step = 1 or step has no value
 inline bool SupportMKLDNNSlice(const SliceParam& param) {
   if (param.step.ndim() == 0U) return true;
-  for (uint32_t i = 0; i < param.step.ndim(); ++i) {
+  for (int i = 0; i < param.step.ndim(); ++i) {
     if (param.step[i].has_value() && param.step[i].value() != 1)
       return false;
   }
@@ -431,7 +704,7 @@ inline bool SliceForwardInferStorageType(const nnvm::NodeAttrs& attrs,
   }
 
   if (in_stype == kDefaultStorage) {
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
     if (dev_mask == Context::kCPU && MKLDNNEnvSet()
         && SupportMKLDNNSlice(param)) {
       dispatched = storage_type_assign(&out_stype, kDefaultStorage,
@@ -585,11 +858,11 @@ void SliceCsrImpl(const SliceParam &param, const OpContext& ctx,
   const mxnet::TShape ishape = in.shape();
   const mxnet::TShape oshape = out.shape();
 
-  uint32_t N = ishape.ndim();
-  mxnet::TShape begin(N), end(N);
-  for (uint32_t i = 0; i < N; ++i) {
+  int N = ishape.ndim();
+  mxnet::TShape begin(N, -1), end(N, -1);
+  for (int i = 0; i < N; ++i) {
     int s = 0;
-    if (param.begin[i]) {
+    if (i < param.begin.ndim() && param.begin[i]) {
       s = *param.begin[i];
       if (s < 0) s += ishape[i];
     }
@@ -629,13 +902,15 @@ void SliceEx(const nnvm::NodeAttrs& attrs,
 }
 
 template<int ndim>
-inline void GetIndexRange(const mxnet::TShape& dshape,
-                          const nnvm::Tuple<dmlc::optional<int>>& param_begin,
-                          const nnvm::Tuple<dmlc::optional<int>>& param_end,
-                          const nnvm::Tuple<dmlc::optional<int>>& param_step,
+inline bool GetIndexRange(const mxnet::TShape& dshape,
+                          const mxnet::Tuple<dmlc::optional<index_t>>& param_begin,
+                          const mxnet::Tuple<dmlc::optional<index_t>>& param_end,
+                          const mxnet::Tuple<dmlc::optional<index_t>>& param_step,
                           common::StaticArray<index_t, ndim>* begin,
                           common::StaticArray<index_t, ndim>* end,
                           common::StaticArray<index_t, ndim>* step) {
+  // Function returns false if output is zero-sized, true otherwise.
+  bool zero_size_shape = false;
   CHECK_NE(dshape.ndim(), 0U);
   CHECK_LE(param_begin.ndim(), dshape.ndim())
     << "Slicing axis exceeds data dimensions";
@@ -647,13 +922,13 @@ inline void GetIndexRange(const mxnet::TShape& dshape,
     << "Static array size=" << ndim
     << " is not equal to data shape ndim=" << dshape.ndim();
 
-  if (param_step.ndim() != 0U) {
+  if (param_step.ndim() > 0) {
     CHECK_EQ(param_step.ndim(), param_begin.ndim())
       << "step and begin must have the same length";
   }
 
-  for (index_t i = 0; i < param_begin.ndim(); ++i) {
-    index_t s = param_step.ndim() != 0U && param_step[i].has_value() ? param_step[i].value() : 1;
+  for (int i = 0; i < param_begin.ndim(); ++i) {
+    index_t s = param_step.ndim() > 0 && param_step[i].has_value() ? param_step[i].value() : 1;
     CHECK_NE(s, 0) << "slice op step[" << i << "] cannot be 0";
 
     index_t b = 0, e = 0;
@@ -662,55 +937,60 @@ inline void GetIndexRange(const mxnet::TShape& dshape,
       b = param_begin[i].has_value() ? param_begin[i].value() : (s < 0 ? len - 1 : 0);
       e = param_end[i].has_value() ? param_end[i].value() : (s < 0 ? -1 : len);
 
-      // checking upper and lower bounds for begin
       if (b < 0) {
         b += len;
-        CHECK_GE(b, 0) << "slicing with begin[" << i << "]=" << b - len
-                       << " exceeds limit of input dimension[" << i << "]=" << len;
       }
-      CHECK_LT(b, len) << "slicing with begin[" << i << "]=" << b
-                       << " exceeds limit of input dimension[" << i << "]=" << len;
-
-      // checking upper and lower bounds for end
       if (e < 0 && param_end[i].has_value()) {
         e += len;
-        CHECK_GE(e, 0) << "slicing with end[" << i << "]=" << e - len
-                       << " exceeds limit of input dimension[" << i << "]=" << len;
       }
-      CHECK_LE(e, len) << "slicing with end[" << i << "]=" << e
-                       << " exceeds limit of input dimension[" << i << "]=" << len;
 
-      // checking begin==end case which is not supported
-      CHECK_NE(b, e) << "slicing with begin[" << i << "]=end[" << i << "]="
-                     << e << " results in an empty tensor and is not supported";
+      // move the begin and end to correct position for calculating dim size
+      b = (b < 0 && s > 0) ? 0 : b;
+      b = (b > len - 1 && s < 0) ? len - 1 : b;
+      // if the start value lead to empty tensor under step s, use -1 for indication
+      b = (b < 0 || b > len - 1) ? -1 : b;
+      e = e > -1 ? e : -1;
+      e = e > len ? len : e;
+    } else if (len == 0) {
+      b = 0;
+      e = 0;
     }
 
     (*begin)[i] = b;
     (*end)[i] = e;
     (*step)[i] = s;
+    // checking begin==end
+    if (b == e) {
+      zero_size_shape = true;
+    }
   }
 
-  for (index_t i = param_begin.ndim(); i < dshape.ndim(); ++i) {
+  for (int i = param_begin.ndim(); i < dshape.ndim(); ++i) {
     (*begin)[i] = 0;
     (*end)[i] = dshape[i];
     (*step)[i] = 1;
   }
+
+  return zero_size_shape;
 }
 
-inline void SetSliceOpOutputDimSize(const index_t i, const int b,
-                                    const int e, const int s,
+inline void SetSliceOpOutputDimSize(const mxnet::TShape& dshape,
+                                    const index_t i, const index_t b,
+                                    const index_t e, const index_t s,
                                     mxnet::TShape* oshape) {
-  if (e != b) {
+  if (!mxnet::dim_size_is_known(dshape, i)) {
+    (*oshape)[i] = -1;
+    return;
+  }
+  if (e != b && b >= 0) {
     if (s > 0) {
-      CHECK_LT(b, e) << "slicing with begin=[" << i << "]=" << b << ", end[" << i << "]="
-                     << e << ", and step[" << i << "]=" << s << " is invalid";
-      (*oshape)[i] = (e - b - 1) / s + 1;
+      (*oshape)[i] = e > b ? (e - b - 1) / s + 1 : 0;
     } else {
-      CHECK_LT(e, b) << "slicing with begin=[" << i << "]=" << b << ", end[" << i << "]="
-                     << e << ", and step[" << i << "]=" << s << " is invalid";
-      (*oshape)[i] = (b - e - 1) / (-s) + 1;
+      (*oshape)[i] = e < b ? (b - e - 1) / (-s) + 1 : 0;
     }
-  }  // else leave oshape[i] as 0 for partial infer
+  } else {
+      (*oshape)[i] = 0;
+  }
 }
 
 inline bool SliceOpShape(const nnvm::NodeAttrs& attrs,
@@ -719,21 +999,22 @@ inline bool SliceOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape& dshape = (*in_attrs)[0];
-  if (dshape.ndim() == 0) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
+  CHECK_GT(dshape.ndim(), 0) << "slice only works for ndim > 0";
   const SliceParam& param = nnvm::get<SliceParam>(attrs.parsed);
   mxnet::TShape oshape = dshape;
 
   MXNET_NDIM_SWITCH(dshape.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
     GetIndexRange(dshape, param.begin, param.end, param.step, &begin, &end, &step);
-    for (index_t i = 0; i < param.begin.ndim(); ++i) {
-      const int b = begin[i], e = end[i], s = step[i];
-      SetSliceOpOutputDimSize(i, b, e, s, &oshape);
+    for (int i = 0; i < param.begin.ndim(); ++i) {
+      const index_t b = begin[i], e = end[i], s = step[i];
+      SetSliceOpOutputDimSize(dshape, i, b, e, s, &oshape);
     }
-  });
+  })
 
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, oshape);
-  return !shape_is_none(dshape) && !shape_is_none(oshape);
+  return shape_is_known(dshape) && shape_is_known(oshape);
 }
 
 template<int ndim, int req, typename xpu>
@@ -811,11 +1092,12 @@ void SliceOpForward(const nnvm::NodeAttrs& attrs,
   Stream<xpu>* s = ctx.get_stream<xpu>();
   const TBlob& data = inputs[0];
   const TBlob& out = outputs[0];
+  if (out.Size() == 0) return;
   const SliceParam& param = nnvm::get<SliceParam>(attrs.parsed);
   MXNET_NDIM_SWITCH(data.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
     GetIndexRange(data.shape_, param.begin, param.end, param.step, &begin, &end, &step);
-    MSHADOW_TYPE_SWITCH(out.type_flag_, DType, {
+    MSHADOW_TYPE_SWITCH_WITH_BOOL(out.type_flag_, DType, {
       MXNET_ASSIGN_REQ_SWITCH(req[0], Req, {
         size_t num_threads = out.shape_.FlatTo2D()[0];
         if (std::is_same<xpu, gpu>::value) {
@@ -910,6 +1192,7 @@ void SliceOpBackward(const nnvm::NodeAttrs& attrs,
   } else if (req[0] == kWriteInplace) {
     LOG(FATAL) << "_slice_backward does not support kWriteInplace";
   }
+  if (ograd.Size() == 0) return;
   MXNET_NDIM_SWITCH(ograd.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
     GetIndexRange(igrad.shape_, param.begin, param.end, param.step, &begin, &end, &step);
@@ -933,17 +1216,17 @@ inline bool SliceAssignOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 2U);
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape& dshape = (*in_attrs)[0];
-  if (dshape.ndim() == 0U || dshape.Size() == 0U) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
   mxnet::TShape vshape = dshape;  // vshape is the value shape on the right hand side
   const SliceParam& param = nnvm::get<SliceParam>(attrs.parsed);
   MXNET_NDIM_SWITCH(dshape.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
     GetIndexRange(dshape, param.begin, param.end, param.step, &begin, &end, &step);
-    for (index_t i = 0; i < param.begin.ndim(); ++i) {
-      const int b = begin[i], e = end[i], s = step[i];
-      SetSliceOpOutputDimSize(i, b, e, s, &vshape);
+    for (int i = 0; i < param.begin.ndim(); ++i) {
+      const index_t b = begin[i], e = end[i], s = step[i];
+      SetSliceOpOutputDimSize(dshape, i, b, e, s, &vshape);
     }
-  });
+  })
   SHAPE_ASSIGN_CHECK(*in_attrs, 1, vshape);
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, dshape);
   return true;
@@ -976,10 +1259,14 @@ void SliceAssignOpForward(const nnvm::NodeAttrs& attrs,
   const SliceParam& param = nnvm::get<SliceParam>(attrs.parsed);
   MXNET_NDIM_SWITCH(data.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
-    GetIndexRange(data.shape_, param.begin, param.end, param.step, &begin, &end, &step);
+    bool zero_size_shape = GetIndexRange(data.shape_, param.begin, param.end, param.step,
+                                        &begin, &end, &step);
+    if (zero_size_shape) {
+      return;  // slice_assign of zero-sized subspace needs no operation.
+    }
     MSHADOW_TYPE_SWITCH(out.type_flag_, DType, {
       MXNET_ASSIGN_REQ_SWITCH(req[0], Req, {
-        int num_threads = val.shape_.FlatTo2D()[0];
+        index_t num_threads = val.shape_.FlatTo2D()[0];
         if (std::is_same<xpu, gpu>::value) {
           num_threads *= val.shape_.get<ndim>()[ndim - 1];
         }
@@ -993,8 +1280,8 @@ void SliceAssignOpForward(const nnvm::NodeAttrs& attrs,
 
 struct SliceAssignScalarParam : public dmlc::Parameter<SliceAssignScalarParam> {
   double scalar;
-  nnvm::Tuple<dmlc::optional<int>> begin, end;
-  nnvm::Tuple<dmlc::optional<int>> step;
+  mxnet::Tuple<dmlc::optional<index_t>> begin, end;
+  mxnet::Tuple<dmlc::optional<index_t>> step;
   DMLC_DECLARE_PARAMETER(SliceAssignScalarParam) {
     DMLC_DECLARE_FIELD(scalar)
     .set_default(0)
@@ -1004,7 +1291,7 @@ struct SliceAssignScalarParam : public dmlc::Parameter<SliceAssignScalarParam> {
     DMLC_DECLARE_FIELD(end)
     .describe("ending indices for the slice operation, supports negative indices.");
     DMLC_DECLARE_FIELD(step)
-    .set_default(nnvm::Tuple<dmlc::optional<int>>())
+    .set_default(mxnet::Tuple<dmlc::optional<index_t>>())
     .describe("step for the slice operation, supports negative values.");
   }
 };
@@ -1015,7 +1302,7 @@ inline bool SliceAssignScalarOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape& dshape = (*in_attrs)[0];
-  if (dshape.ndim() == 0U || dshape.Size() == 0U) return false;
+  if (!shape_is_known(dshape)) return false;
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, dshape);
   return true;
 }
@@ -1077,12 +1364,16 @@ void SliceAssignScalarOpForward(const nnvm::NodeAttrs& attrs,
   const SliceAssignScalarParam& param = nnvm::get<SliceAssignScalarParam>(attrs.parsed);
   MXNET_NDIM_SWITCH(data.ndim(), ndim, {
     common::StaticArray<index_t, ndim> begin, end, step;
-    GetIndexRange(data.shape_, param.begin, param.end, param.step, &begin, &end, &step);
-    for (index_t i = 0; i < param.begin.ndim(); ++i) {
-      const int b = begin[i], e = end[i], s = step[i];
-      SetSliceOpOutputDimSize(i, b, e, s, &vshape);
+    bool zero_size_shape = GetIndexRange(data.shape_, param.begin, param.end, param.step,
+                                        &begin, &end, &step);
+    if (zero_size_shape) {
+      return;  // slice_assign of zero-sized subspaced needs no operation.
     }
-    MSHADOW_TYPE_SWITCH(out.type_flag_, DType, {
+    for (index_t i = 0; i < param.begin.ndim(); ++i) {
+      const index_t b = begin[i], e = end[i], s = step[i];
+      SetSliceOpOutputDimSize(data.shape_, i, b, e, s, &vshape);
+    }
+    MSHADOW_TYPE_SWITCH_WITH_BOOL(out.type_flag_, DType, {
       mxnet_op::Kernel<slice_assign_scalar<ndim>, xpu>::Launch(s, vshape.FlatTo2D()[0],
           out.dptr<DType>(), static_cast<DType>(param.scalar), req[0],
           out.shape_.get<ndim>(), vshape.get<ndim>(), begin, step);
@@ -1092,8 +1383,8 @@ void SliceAssignScalarOpForward(const nnvm::NodeAttrs& attrs,
 
 struct SliceAxisParam : public dmlc::Parameter<SliceAxisParam> {
   int axis;
-  int begin;
-  dmlc::optional<int> end;
+  index_t begin;
+  dmlc::optional<index_t> end;
   DMLC_DECLARE_PARAMETER(SliceAxisParam) {
     DMLC_DECLARE_FIELD(axis)
       .describe("Axis along which to be sliced, supports negative indexes.");
@@ -1110,9 +1401,9 @@ inline void GetSliceAxisParams(const SliceAxisParam& param, const mxnet::TShape&
                            int* axis, index_t* begin, index_t* end) {
   *axis = param.axis;
   if (*axis < 0) {
-    *axis += static_cast<int>(ishape.ndim());
+    *axis += ishape.ndim();
   }
-  CHECK(*axis < static_cast<int>(ishape.ndim()) && *axis >= 0) <<
+  CHECK(*axis < ishape.ndim() && *axis >= 0) <<
     "Transformed axis must be smaller than the source ndim and larger than zero! Recieved axis=" <<
     param.axis << ", src_ndim=" << ishape.ndim() << ", transformed axis=" << *axis;
   index_t axis_size = static_cast<index_t>(ishape[*axis]);
@@ -1121,7 +1412,7 @@ inline void GetSliceAxisParams(const SliceAxisParam& param, const mxnet::TShape&
   if (*begin < 0) {
     *begin += axis_size;
   }
-  if (axis_size) {
+  if (axis_size > 0) {
     if (!static_cast<bool>(param.end)) {
       *end = axis_size;
     } else {
@@ -1149,19 +1440,24 @@ inline bool SliceAxisShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
   mxnet::TShape& ishape = (*in_attrs)[0];
+  if (!mxnet::ndim_is_known(ishape)) return false;
   int axis;
   index_t begin, end;
   GetSliceAxisParams(param, ishape, &axis, &begin, &end);
-  mxnet::TShape shape(ishape.ndim());
-  for (index_t i = 0; i < ishape.ndim(); ++i) {
-    if (static_cast<int>(i) == axis) {
+  if (!mxnet::dim_size_is_known(ishape, axis)) {
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, ishape);
+    return false;
+  }
+  mxnet::TShape shape(ishape.ndim(), -1);
+  for (int i = 0; i < ishape.ndim(); ++i) {
+    if (i == axis) {
       shape[i] = static_cast<index_t>(end - begin);
     } else {
       shape[i] = ishape[i];
     }
   }
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, shape);
-  return true;
+  return shape_is_known(shape);
 }
 
 
@@ -1177,7 +1473,7 @@ void SliceAxis(const nnvm::NodeAttrs& attrs,
   int axis;
   index_t begin, end;
   GetSliceAxisParams(param, inputs[0].shape_, &axis, &begin, &end);
-  int ndim = static_cast<int>(outputs[0].ndim());
+  int ndim = outputs[0].ndim();
 
   if (axis + 1 == ndim) {
     MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
@@ -1205,6 +1501,9 @@ void SliceAxisGrad_(const nnvm::NodeAttrs& attrs,
                 const std::vector<TBlob>& inputs,
                 const std::vector<OpReqType>& req,
                 const std::vector<TBlob>& outputs) {
+  if (outputs[0].shape_.Size() == 0) {
+    return;
+  }
   const SliceAxisParam& param = nnvm::get<SliceAxisParam>(attrs.parsed);
   using namespace mshadow::op;
   using namespace mshadow::expr;
@@ -1212,8 +1511,7 @@ void SliceAxisGrad_(const nnvm::NodeAttrs& attrs,
   int axis;
   index_t begin, end;
   GetSliceAxisParams(param, outputs[0].shape_, &axis, &begin, &end);
-  int ndim = static_cast<int>(outputs[0].shape_.ndim());
-
+  int ndim = outputs[0].shape_.ndim();
   if (axis + 1 == ndim) {
     MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
         mshadow::Tensor<xpu, 2, DType> ograd =
@@ -1248,9 +1546,9 @@ void SliceAxisGrad_(const nnvm::NodeAttrs& attrs,
 }
 
 struct SliceLikeParam : public dmlc::Parameter<SliceLikeParam> {
-  mxnet::TShape axes;
+  mxnet::Tuple<int> axes;
   DMLC_DECLARE_PARAMETER(SliceLikeParam) {
-    DMLC_DECLARE_FIELD(axes).set_default(mxnet::TShape())
+    DMLC_DECLARE_FIELD(axes).set_default(mxnet::Tuple<int>())
     .describe("List of axes on which input data will be sliced according to the "
               "corresponding size of the second input. By default will slice on "
               "all axes. Negative axes are supported.");
@@ -1265,11 +1563,14 @@ inline bool SliceLikeShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   mxnet::TShape& ishape = (*in_attrs)[0];
   mxnet::TShape& from_shape = (*in_attrs)[1];
+  if (!mxnet::ndim_is_known(ishape) || !mxnet::ndim_is_known(from_shape)) {
+    return false;
+  }
   if (param.axes.ndim() == 0) {
     CHECK_EQ(ishape.ndim(), from_shape.ndim())
       << "By default slice_axis performs slice on all axes, but ndim mismatch "
          "for inputs: " << ishape.ndim() << " vs. " << from_shape.ndim();
-    for (index_t i = 0; i < ishape.ndim(); ++i) {
+    for (int i = 0; i < ishape.ndim(); ++i) {
       CHECK_GE(ishape[i], from_shape[i])
         << "Slice axis " << i << " with size " << from_shape[i]
         << "exceeds limit of input with size " << ishape[i];
@@ -1277,13 +1578,13 @@ inline bool SliceLikeShape(const nnvm::NodeAttrs& attrs,
     SHAPE_ASSIGN_CHECK(*out_attrs, 0, from_shape);
   } else {
     mxnet::TShape shape(ishape);
-    for (index_t i = 0; i < param.axes.ndim(); ++i) {
-      int axis = static_cast<int>(param.axes[i]);
+    for (int i = 0; i < param.axes.ndim(); ++i) {
+      int axis = param.axes[i];
       if (axis < 0) {
-        axis += static_cast<int>(ishape.ndim());
+        axis += ishape.ndim();
       }
       CHECK_GE(axis, 0)
-        << "Slice axis: " << static_cast<int>(param.axes[i]) << " too small";
+        << "Slice axis: " << param.axes[i] << " too small";
       CHECK_GT(ishape.ndim(), axis)
         << "Slice axis: " << axis << " exceeds first input: " << ishape.ndim();
       CHECK_GT(from_shape.ndim(), axis)
@@ -1300,39 +1601,39 @@ inline bool SliceLikeShape(const nnvm::NodeAttrs& attrs,
 
 inline void SliceLikeInferRanges(const mxnet::TShape& dshape,
                                  const mxnet::TShape& fshape,
-                                 const mxnet::TShape& axes,
-                                 nnvm::Tuple<dmlc::optional<int>>* param_begin,
-                                 nnvm::Tuple<dmlc::optional<int>>* param_end,
-                                 nnvm::Tuple<dmlc::optional<int>>* param_step) {
-  std::vector<dmlc::optional<int>> pb(dshape.ndim());
-  std::vector<dmlc::optional<int>> pe(dshape.ndim());
-  std::vector<dmlc::optional<int>> ps(dshape.ndim());
+                                 const mxnet::Tuple<int>& axes,
+                                 mxnet::Tuple<dmlc::optional<index_t>>* param_begin,
+                                 mxnet::Tuple<dmlc::optional<index_t>>* param_end,
+                                 mxnet::Tuple<dmlc::optional<index_t>>* param_step) {
+  std::vector<dmlc::optional<index_t>> pb(dshape.ndim());
+  std::vector<dmlc::optional<index_t>> pe(dshape.ndim());
+  std::vector<dmlc::optional<index_t>> ps(dshape.ndim());
   if (axes.ndim() == 0) {
-    for (index_t i = 0; i < dshape.ndim(); ++i) {
+    for (int i = 0; i < dshape.ndim(); ++i) {
       pb[i] = 0;
       pe[i] = fshape[i];
       ps[i] = 1;
     }
   } else {
-    for (index_t i = 0; i < axes.ndim(); ++i) {
-      int axis = static_cast<int>(axes[i]);
+    for (int i = 0; i < axes.ndim(); ++i) {
+      int axis = axes[i];
       if (axis < 0) {
-        axis += static_cast<int>(dshape.ndim());
+        axis += dshape.ndim();
       }
       CHECK_GE(axis, 0)
-        << "Slice axis: " << static_cast<int>(axes[i]) << " too small";
-      CHECK_LT(axis, static_cast<int>(dshape.ndim()))
+        << "Slice axis: " << axes[i] << " too small";
+      CHECK_LT(axis, dshape.ndim())
         << "Slice axis: " << axis << " exceeds first input: " << dshape.ndim();
-      CHECK_LT(axis, static_cast<int>(fshape.ndim()))
+      CHECK_LT(axis, fshape.ndim())
         << "Slice axis: " << axis << " exceeds first input: " << fshape.ndim();
       pb[axis] = 0;
       pe[axis] = fshape[axis];
       ps[axis] = 1;
     }
   }
-  *param_begin = nnvm::Tuple<dmlc::optional<int>>(pb.begin(), pb.end());
-  *param_end = nnvm::Tuple<dmlc::optional<int>>(pe.begin(), pe.end());
-  *param_step = nnvm::Tuple<dmlc::optional<int>>(ps.begin(), ps.end());
+  *param_begin = mxnet::Tuple<dmlc::optional<index_t>>(pb.begin(), pb.end());
+  *param_end = mxnet::Tuple<dmlc::optional<index_t>>(pe.begin(), pe.end());
+  *param_step = mxnet::Tuple<dmlc::optional<index_t>>(ps.begin(), ps.end());
 }
 
 template<typename xpu>
@@ -1351,9 +1652,9 @@ void SliceLikeForward(const nnvm::NodeAttrs& attrs,
   const TBlob& out = outputs[0];
   const mxnet::TShape& ishape = data.shape_;
   const mxnet::TShape& from_shape = inputs[1].shape_;
-  nnvm::Tuple<dmlc::optional<int>> param_begin;
-  nnvm::Tuple<dmlc::optional<int>> param_end;
-  nnvm::Tuple<dmlc::optional<int>> param_step;
+  mxnet::Tuple<dmlc::optional<index_t>> param_begin;
+  mxnet::Tuple<dmlc::optional<index_t>> param_end;
+  mxnet::Tuple<dmlc::optional<index_t>> param_step;
   SliceLikeInferRanges(ishape, from_shape, param.axes, &param_begin, &param_end, &param_step);
 
   MXNET_NDIM_SWITCH(data.ndim(), ndim, {
@@ -1399,9 +1700,9 @@ void SliceLikeBackward(const nnvm::NodeAttrs& attrs,
 
   const mxnet::TShape& ishape = ograd.shape_;
   const mxnet::TShape& from_shape = outputs[1].shape_;
-  nnvm::Tuple<dmlc::optional<int>> param_begin;
-  nnvm::Tuple<dmlc::optional<int>> param_end;
-  nnvm::Tuple<dmlc::optional<int>> param_step;
+  mxnet::Tuple<dmlc::optional<index_t>> param_begin;
+  mxnet::Tuple<dmlc::optional<index_t>> param_end;
+  mxnet::Tuple<dmlc::optional<index_t>> param_step;
   SliceLikeInferRanges(ishape, from_shape, param.axes, &param_begin, &param_end, &param_step);
 
   MXNET_NDIM_SWITCH(ograd.ndim(), ndim, {
@@ -1429,13 +1730,21 @@ struct ClipParam : public dmlc::Parameter<ClipParam> {
     DMLC_DECLARE_FIELD(a_max)
     .describe("Maximum value");
   }
+
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream a_min_s, a_max_s;
+    a_min_s << a_min;
+    a_max_s << a_max;
+    (*dict)["a_min"] = a_min_s.str();
+    (*dict)["a_max"] = a_max_s.str();
+  }
 };
 
 
 struct clip {
   template<typename DType>
   MSHADOW_XINLINE static void Map(index_t i, DType* out, const DType* datas,
-                                  DType a_min, DType a_max) {
+                                  const float a_min, const float a_max) {
     DType data = datas[i];
     if (data > a_max) {
       out[i] = a_max;
@@ -1451,7 +1760,7 @@ struct clip {
 struct clip_grad {
   template<typename DType>
   MSHADOW_XINLINE static void Map(index_t i, DType* out, const DType* grad, const DType* datas,
-                                  DType a_min, DType a_max) {
+                                  const float a_min, const float a_max) {
     DType data = datas[i];
     if (data > a_max) {
       out[i] = 0;
@@ -1478,7 +1787,7 @@ void Clip(const nnvm::NodeAttrs& attrs,
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
     mxnet_op::Kernel<mxnet::op::clip, xpu>::Launch(s, outputs[0].Size(), outputs[0].dptr<DType>(),
                                                    inputs[0].dptr<DType>(),
-                                                   DType(param.a_min), DType(param.a_max));
+                                                   param.a_min, param.a_max);
   });
 }
 
@@ -1507,7 +1816,7 @@ void ClipGrad_(const nnvm::NodeAttrs& attrs,
   Stream<xpu> *s = ctx.get_stream<xpu>();
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
     Kernel<clip_grad, xpu>::Launch(s, outputs[0].Size(), outputs[0].dptr<DType>(),
-    inputs[0].dptr<DType>(), inputs[1].dptr<DType>(), DType(param.a_min), DType(param.a_max));
+    inputs[0].dptr<DType>(), inputs[1].dptr<DType>(), param.a_min, param.a_max);
   });
 }
 
@@ -1530,6 +1839,13 @@ struct RepeatParam : public dmlc::Parameter<RepeatParam> {
                 " By default, use the flattened input array,"
                 " and return a flat output array.");
   }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream repeats_s, axis_s;
+    repeats_s << repeats;
+    axis_s << axis;
+    (*dict)["repeats"] = repeats_s.str();
+    (*dict)["axis"] = axis_s.str();
+  }
 };
 
 /*!
@@ -1542,7 +1858,7 @@ inline void GetRepeatParams(const RepeatParam& param, const mxnet::TShape& ishap
   CHECK_GE(*repeats, 0) << "repeats cannot be a negative number";
   *axisOpt = param.axis;
   if (static_cast<bool>(*axisOpt)) {
-    int ndims = static_cast<int>(ishape.ndim());
+    int ndims = ishape.ndim();
     int axis = axisOpt->value();
     if (axis < 0) {
       axis += ndims;
@@ -1558,37 +1874,39 @@ inline bool RepeatOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), 1U);
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape& ishape = (*in_attrs)[0];
+  if (!mxnet::ndim_is_known(ishape)) {
+    return false;
+  }
   int repeats = 0;
   dmlc::optional<int> axisOpt;
   GetRepeatParams(param, ishape, &repeats, &axisOpt);
-  // If 0 repeats, return an empty 0 dim array
+  // If 0 repeats, return an empty 1-dim, 0-size array
   if (0 == repeats) {
-    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape());
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape(1, 0));
     return true;
   }
 
   // If repeats > 0, multiply the size of the corresponding axis by repeats
   if (static_cast<bool>(axisOpt)) {
-    int ndims = static_cast<int>(ishape.ndim());
+    int ndims = ishape.ndim();
     int axis = axisOpt.value();
     if (axis < 0) {
       axis += ndims;
     }
-    mxnet::TShape shape(ishape.ndim());
-    for (index_t i = 0; i < ishape.ndim(); ++i) {
-      if (static_cast<int>(i) == axis) {
-        shape[i] = static_cast<index_t>(repeats) * ishape[i];
+    mxnet::TShape shape(ishape.ndim(), -1);
+    for (int i = 0; i < ishape.ndim(); ++i) {
+      if (i == axis) {
+        shape[i] = repeats * ishape[i];
       } else {
         shape[i] = ishape[i];
       }
     }
     SHAPE_ASSIGN_CHECK(*out_attrs, 0, shape);
   } else {  // If axis is not input by user, return a flat 1D array of size = in.size*repeats
-    mxnet::TShape shape(1);
-    shape[0] = ishape.Size() * static_cast<index_t>(repeats);
+    mxnet::TShape shape(1, ishape.Size() * repeats);
     SHAPE_ASSIGN_CHECK(*out_attrs, 0, shape);
   }
-  return true;
+  return shape_is_known(out_attrs->at(0));
 }
 
 inline bool RepeatOpType(const nnvm::NodeAttrs& attrs,
@@ -1616,16 +1934,16 @@ inline std::pair<mxnet::TShape, mxnet::TShape> ReshapeInputOutputForRepeatOp(
   const int repeats) {
   if (static_cast<bool>(axisOpt)) {
     int axis = axisOpt.value();
-    int ndim = static_cast<int>(ishape.ndim());
+    int ndim = ishape.ndim();
     if (axis < 0)  {
       axis += ndim;
     }
-    CHECK(axis >= 0 && axis < static_cast<int>(ishape.ndim())) << "Invalid input of axis";
+    CHECK(axis >= 0 && axis < ishape.ndim()) << "Invalid input of axis";
 
     // reshape the input tensor by adding a dim at the (axis+1)-th dim
-    mxnet::TShape rshape(ishape.ndim()+1);
+    mxnet::TShape rshape(ishape.ndim()+1, 1);
     // the shape we want to broadcast to
-    mxnet::TShape bshape(rshape.ndim());
+    mxnet::TShape bshape(rshape.ndim(), 1);
     int i = 0;
     while (i <= axis) {
       rshape[i] = bshape[i] = ishape[i];
@@ -1633,7 +1951,7 @@ inline std::pair<mxnet::TShape, mxnet::TShape> ReshapeInputOutputForRepeatOp(
     }
     rshape[i] = 1;
     bshape[i] = repeats;
-    while (i < static_cast<int>(ishape.ndim())) {
+    while (i < ishape.ndim()) {
       rshape[i+1] = ishape[i];
       bshape[i+1] = ishape[i];
       ++i;
@@ -1644,11 +1962,11 @@ inline std::pair<mxnet::TShape, mxnet::TShape> ReshapeInputOutputForRepeatOp(
     // reshape the tensor into shape (ishape.Size(), 1)
     // then add one dim at axis = 1 and broadcast to
     // shape (ishape.Size(), repeats)
-    mxnet::TShape rshape(2);
+    mxnet::TShape rshape(2, 1);
     rshape[0] = ishape.Size();
     rshape[1] = 1;
 
-    mxnet::TShape bshape(2);
+    mxnet::TShape bshape(2, 1);
     bshape[0] = rshape[0];
     bshape[1] = repeats;
     return std::make_pair(rshape, bshape);
@@ -1663,7 +1981,7 @@ void RepeatOpForward(const nnvm::NodeAttrs& attrs,
                      const std::vector<TBlob>& outputs) {
   const TBlob& iTBlob = inputs[0];
   const mxnet::TShape& ishape = iTBlob.shape_;
-  if (ishape.ndim() == 0) return;
+  if (!shape_is_known(ishape)) return;
 
   int repeats = 0;
   dmlc::optional<int> axisOpt;
@@ -1707,7 +2025,7 @@ void RepeatOpBackward(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(outputs.size(), 1U);
 
   const mxnet::TShape& oshape = outputs[0].shape_;
-  if (oshape.ndim() == 0) return;
+  if (!shape_is_known(oshape)) return;
 
   int repeats = 0;
   dmlc::optional<int> axisOpt;
@@ -1728,12 +2046,17 @@ void RepeatOpBackward(const nnvm::NodeAttrs& attrs,
     inputs[0].type_flag_, inputs[0].dev_id());
   std::vector<TBlob> newInputs = {iblob};
 
-  ReduceAxesComputeImpl<xpu, mshadow::red::sum, false>(
+#if !defined(__CUDACC__)
+  ReduceAxesComputeImpl<xpu, mshadow::red::sum, false, false>(
       ctx, newInputs, req, newOutputs, rshapes.first);
+#else
+  ReduceAxesRTCComputeImpl(ctx, newInputs, req, newOutputs, rshapes.first,
+                           "red::sum{}", nullptr, false);
+#endif
 }
 
 struct TileParam : public dmlc::Parameter<TileParam> {
-  mxnet::TShape reps;
+  mxnet::Tuple<int> reps;
   DMLC_DECLARE_PARAMETER(TileParam) {
     DMLC_DECLARE_FIELD(reps)
       .describe("The number of times for repeating the tensor a. Each dim size of reps"
@@ -1741,6 +2064,11 @@ struct TileParam : public dmlc::Parameter<TileParam> {
                 " If reps has length d, the result will have dimension of max(d, a.ndim);"
                 " If a.ndim < d, a is promoted to be d-dimensional by prepending new axes."
                 " If a.ndim > d, reps is promoted to a.ndim by pre-pending 1's to it.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream reps_s;
+    reps_s << reps;
+    (*dict)["reps"] = reps_s.str();
   }
 };
 
@@ -1751,19 +2079,19 @@ inline bool TileOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   const TileParam& param = nnvm::get<TileParam>(attrs.parsed);
   const mxnet::TShape& ishape = (*in_attrs)[0];
-  const mxnet::TShape& reps = param.reps;
+  if (!shape_is_known(ishape)) {
+    return false;
+  }
+  const mxnet::Tuple<int>& reps = param.reps;
   // If reps is empty, return a identical input array
-  if (reps.ndim() == 0 || ishape.ndim() == 0) {
+  if (reps.ndim() == 0) {
     SHAPE_ASSIGN_CHECK(*out_attrs, 0, ishape);
     return true;
   }
-  for (size_t i = 0; i < reps.ndim(); ++i) {
-    CHECK_GT(reps[i], 0) << "invalid reps=" << i << ", dim size must be greater than zero";
-  }
-  mxnet::TShape oshape(std::max(ishape.ndim(), reps.ndim()));
-  int i1 = static_cast<int>(ishape.ndim()) - 1;
-  int i2 = static_cast<int>(reps.ndim()) - 1;
-  for (int i = static_cast<int>(oshape.ndim()) - 1; i >= 0; --i) {
+  mxnet::TShape oshape(std::max(ishape.ndim(), reps.ndim()), -1);
+  int i1 = ishape.ndim() - 1;
+  int i2 = reps.ndim() - 1;
+  for (int i = oshape.ndim() - 1; i >= 0; --i) {
     if (i1 >= 0 && i2 >= 0) {
       oshape[i] = ishape[i1--] * reps[i2--];
     } else if (i1 >= 0) {
@@ -1772,8 +2100,13 @@ inline bool TileOpShape(const nnvm::NodeAttrs& attrs,
       oshape[i] = reps[i2--];
     }
   }
+  // If reps contains 0s, oshape is a zero-size shape.
+  // Need to distinguish between np_shape mode and legacy mode.
+  if (!Imperative::Get()->is_np_shape()) {
+    common::ConvertToNumpyShape(&oshape);
+  }
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, oshape);
-  return true;
+  return shape_is_known(oshape);
 }
 
 inline bool TileOpType(const nnvm::NodeAttrs& attrs,
@@ -1790,27 +2123,27 @@ inline bool TileOpType(const nnvm::NodeAttrs& attrs,
 
 /*!
  * \brief Reshape the input and output tensors for
- * using broadcast_to to achieve the funcitonality
+ * using broadcast_to to achieve the functionality
  * of operator tile.
  * \return a pair of mxnet::TShape's, first is the reshaped
  * input shape, second is the reshaped output shape.
  */
 inline std::pair<mxnet::TShape, mxnet::TShape> ReshapeInputOutputForTileOp(
   const mxnet::TShape& ishape,
-  const mxnet::TShape& reps) {
-  if (ishape.ndim() == 0 || reps.ndim() == 0) {
+  const mxnet::Tuple<int>& reps) {
+  if (reps.ndim() == 0) {
     return std::make_pair(ishape, ishape);
   }
 
   // The shape we want to broadcast to
-  mxnet::TShape bshape(std::max(ishape.ndim(), reps.ndim()) * 2);
+  mxnet::TShape bshape(std::max(ishape.ndim(), reps.ndim()) * 2, 1);
 
   // The shape of the input tensor after adding new axes before each dim
-  mxnet::TShape rshape(bshape.ndim());
+  mxnet::TShape rshape(bshape.ndim(), 1);
 
-  int i1 = static_cast<int>(ishape.ndim()) - 1;
-  int i2 = static_cast<int>(reps.ndim()) - 1;
-  for (int i = static_cast<int>(bshape.ndim()) - 1; i >= 0; --i) {
+  int i1 = ishape.ndim() - 1;
+  int i2 = reps.ndim() - 1;
+  for (int i = bshape.ndim() - 1; i >= 0; --i) {
     if (0 == (i & 1)) {
       bshape[i] = (i2 >= 0? reps[i2--] : 1);
       rshape[i] = 1;
@@ -1850,10 +2183,10 @@ void TileOpForward(const nnvm::NodeAttrs& attrs,
 
   if (inputs[0].Size() == 0) return;
   const mxnet::TShape& ishape = inputs[0].shape_;
-  const mxnet::TShape& reps = nnvm::get<TileParam>(attrs.parsed).reps;
+  const mxnet::Tuple<int>& reps = nnvm::get<TileParam>(attrs.parsed).reps;
 
   // If any one of the number in reps is zero, return immediately
-  for (index_t i = 0; i < reps.ndim(); ++i) {
+  for (int i = 0; i < reps.ndim(); ++i) {
     if (0 == reps[i]) return;
   }
 
@@ -1892,10 +2225,10 @@ void TileOpBackward(const nnvm::NodeAttrs& attrs,
 
   if (inputs[0].Size() == 0) return;
   const mxnet::TShape& oshape = outputs[0].shape_;
-  const mxnet::TShape& reps = nnvm::get<TileParam>(attrs.parsed).reps;
+  const mxnet::Tuple<int>& reps = nnvm::get<TileParam>(attrs.parsed).reps;
 
   // If any one of the number in reps is zero, return immediately
-  for (index_t i = 0; i < reps.ndim(); ++i) {
+  for (int i = 0; i < reps.ndim(); ++i) {
     if (0 == reps[i]) return;
   }
 
@@ -1910,12 +2243,17 @@ void TileOpBackward(const nnvm::NodeAttrs& attrs,
     inputs[0].type_flag_, inputs[0].dev_id());
   std::vector<TBlob> newInputs = {iblob};
 
-  ReduceAxesComputeImpl<xpu, mshadow::red::sum, false>(
+#if !defined(__CUDACC__)
+  ReduceAxesComputeImpl<xpu, mshadow::red::sum, false, false>(
       ctx, newInputs, req, newOutputs, rshapes.first);
+#else
+  ReduceAxesRTCComputeImpl(ctx, newInputs, req, newOutputs, rshapes.first,
+                           "red::sum{}", nullptr, false);
+#endif
 }
 
 struct ReverseParam : public dmlc::Parameter<ReverseParam> {
-  nnvm::Tuple<int> axis;
+  mxnet::Tuple<int> axis;
   DMLC_DECLARE_PARAMETER(ReverseParam) {
     DMLC_DECLARE_FIELD(axis)
     .describe("The axis which to reverse elements.");
@@ -1926,10 +2264,10 @@ struct ReverseParam : public dmlc::Parameter<ReverseParam> {
 #define REVERSE_MAX_DIM 10U
 
 struct reverse {
-  MSHADOW_XINLINE static int ReverseIndex(index_t idx,
-                                          index_t nreversedim,
-                                          const index_t * stride_,
-                                          const index_t * trailing_) {
+  MSHADOW_XINLINE static index_t ReverseIndex(index_t idx,
+                                              index_t nreversedim,
+                                              const index_t * stride_,
+                                              const index_t * trailing_) {
     index_t outputIndex = idx;
     for (index_t i = 0; i < nreversedim; ++i) {
       const index_t low = outputIndex % trailing_[i];
@@ -1986,10 +2324,10 @@ void ReverseOpForward(const nnvm::NodeAttrs& attrs,
   std::vector<index_t>  trailing_(param.axis.ndim());
   index_t reverse_index = 0;
   for (int axis : param.axis) {
-    CHECK_LT(axis, static_cast<int>(ishape.ndim()));
+    CHECK_LT(axis, ishape.ndim());
     stride_[reverse_index] = ishape[axis];
     trailing_[reverse_index] = 1;
-    for (index_t i2 = axis + 1; i2 < ishape.ndim(); ++i2) {
+    for (int i2 = axis + 1; i2 < ishape.ndim(); ++i2) {
       trailing_[reverse_index] *= ishape[i2];
     }
     reverse_index++;
@@ -2038,6 +2376,13 @@ struct StackParam : public dmlc::Parameter<StackParam> {
     DMLC_DECLARE_FIELD(num_args).set_lower_bound(1)
     .describe("Number of inputs to be stacked.");
   }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream axis_s, num_args_s;
+    axis_s << axis;
+    num_args_s << num_args;
+    (*dict)["axis"] = axis_s.str();
+    (*dict)["num_args"] = num_args_s.str();
+  }
 };
 
 
@@ -2050,9 +2395,9 @@ inline bool StackOpShape(const nnvm::NodeAttrs& attrs,
   for (const mxnet::TShape& i : (*in_attrs)) {
     shape_assign(&dshape, i);
   }
-  if (dshape.ndim() == 0) return false;
+  if (!shape_is_known(dshape)) return false;
 
-  mxnet::TShape oshape(dshape.ndim() + 1);
+  mxnet::TShape oshape(dshape.ndim() + 1, -1);
   int axis = CheckAxis(param.axis, oshape.ndim());
   for (int i = 0; i < axis; ++i) {
     oshape[i] = dshape[i];
@@ -2063,7 +2408,7 @@ inline bool StackOpShape(const nnvm::NodeAttrs& attrs,
   }
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, oshape);
 
-  return true;
+  return shape_is_known(oshape);
 }
 
 
@@ -2079,7 +2424,7 @@ void StackOpForward(const nnvm::NodeAttrs& attrs,
   int axis = CheckAxis(param.axis, outputs[0].ndim());
 
   Stream<xpu> *s = ctx.get_stream<xpu>();
-  MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
+  MSHADOW_TYPE_SWITCH_WITH_BOOL(outputs[0].type_flag_, DType, {
     std::vector<Tensor<xpu, 3, DType> > data(inputs.size());
     Tensor<xpu, 3, DType> out;
     size_t leading = 1, trailing = 1;
@@ -2113,7 +2458,7 @@ void StackOpBackward(const nnvm::NodeAttrs& attrs,
   int axis = CheckAxis(param.axis, inputs[0].ndim());
 
   Stream<xpu> *s = ctx.get_stream<xpu>();
-  MSHADOW_TYPE_SWITCH(inputs[0].type_flag_, DType, {
+  MSHADOW_TYPE_SWITCH_WITH_BOOL(inputs[0].type_flag_, DType, {
     std::vector<Tensor<xpu, 3, DType> > grad_in(outputs.size());
     Tensor<xpu, 3, DType> grad;
     size_t leading = 1, trailing = 1;
@@ -2136,12 +2481,17 @@ void StackOpBackward(const nnvm::NodeAttrs& attrs,
 }
 
 struct SqueezeParam : public dmlc::Parameter<SqueezeParam> {
-  dmlc::optional<mxnet::TShape> axis;
+  dmlc::optional<mxnet::Tuple<int>> axis;
   DMLC_DECLARE_PARAMETER(SqueezeParam) {
     DMLC_DECLARE_FIELD(axis)
-    .set_default(dmlc::optional<mxnet::TShape>())
+    .set_default(dmlc::optional<mxnet::Tuple<int>>())
     .describe("Selects a subset of the single-dimensional entries in the shape."
               " If an axis is selected with shape entry greater than one, an error is raised.");
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream axis_s;
+    axis_s << axis;
+    (*dict)["axis"] = axis_s.str();
   }
 };
 
@@ -2152,8 +2502,8 @@ struct SqueezeParam : public dmlc::Parameter<SqueezeParam> {
 inline size_t SqueezeShapeHelper(mxnet::TShape* shape) {
   CHECK(shape != nullptr);
   size_t count = 0;
-  for (size_t i = 0; i < shape->ndim(); ++i) {
-    if ((*shape)[i] == 0) {
+  for (int i = 0; i < shape->ndim(); ++i) {
+    if ((*shape)[i] == -1) {
       ++count;
     } else {
       std::swap((*shape)[i], (*shape)[i-count]);
@@ -2170,12 +2520,12 @@ inline bool SqueezeShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   const mxnet::TShape& dshape = in_attrs->at(0);
   const int dndim = dshape.ndim();
-  if (shape_is_none(dshape)) return false;
+  if (!shape_is_known(dshape)) return false;
   mxnet::TShape oshape = dshape;
   if (param.axis.has_value()) {
     // preprocess axis
-    mxnet::TShape axes = param.axis.value();
-    for (size_t i = 0; i < axes.ndim(); ++i) {
+    mxnet::Tuple<int> axes = param.axis.value();
+    for (int i = 0; i < axes.ndim(); ++i) {
       if (axes[i] < 0) {
         axes[i] += dndim;
         CHECK_GE(axes[i], 0)
@@ -2186,12 +2536,12 @@ inline bool SqueezeShape(const nnvm::NodeAttrs& attrs,
       CHECK_EQ(dshape[axes[i]], 1)
         << "cannot select an axis to squeeze out which has size="
         << dshape[axes[i]] << " not equal to one";
-      CHECK_NE(oshape[axes[i]], 0) << "duplicate value in axis";
-      oshape[axes[i]] = 0;
+      CHECK_NE(oshape[axes[i]], -1) << "duplicate value in axis";
+      oshape[axes[i]] = -1;
     }
   } else {
-    for (size_t i = 0; i < oshape.ndim(); ++i) {
-      if (oshape[i] == 1) oshape[i] = 0;
+    for (int i = 0; i < oshape.ndim(); ++i) {
+      if (oshape[i] == 1) oshape[i] = -1;
     }
   }
   size_t oshape_size = SqueezeShapeHelper(&oshape);
@@ -2219,9 +2569,12 @@ inline bool DepthToSpaceOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   CHECK_EQ(in_attrs->at(0).ndim(), 4) << "Operation Depth To Space requires exactly 4D tensor";
 
-  mxnet::TShape expected_out(4);
+  mxnet::TShape expected_out(4, -1);
 
   mxnet::TShape& in_shape = in_attrs->at(0);
+  if (!mxnet::ndim_is_known(in_shape)) {
+    return false;
+  }
   int block = param.block_size;
   CHECK_NE(block, 0) << "block_size must be a positive integer value";
   CHECK_NE(in_shape[1], 0) << "Depth dimension:1 cannot be 0";
@@ -2237,14 +2590,14 @@ inline bool DepthToSpaceOpShape(const nnvm::NodeAttrs& attrs,
 
   expected_out[0] = in_shape[0];
   expected_out[1] = in_shape[1] / (block * block);
-  size_t i = 2;
+  int i = 2;
   while (i < expected_out.ndim()) {
     expected_out[i] = in_shape[i] * block;
     ++i;
   }
 
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, expected_out);
-  return true;
+  return shape_is_known(expected_out);
 }
 
 inline bool DepthToSpaceOpType(const nnvm::NodeAttrs& attrs,
@@ -2383,9 +2736,12 @@ inline bool SpaceToDepthOpShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
   CHECK_EQ(in_attrs->at(0).ndim(), 4) << "Operation Space To Depth requires exactly 4D tensor";
 
-  mxnet::TShape expected_out(in_attrs->at(0).ndim());
+  mxnet::TShape expected_out(in_attrs->at(0).ndim(), -1);
 
   mxnet::TShape& in_shape = in_attrs->at(0);
+  if (!mxnet::ndim_is_known(in_shape)) {
+    return false;
+  }
   int block = param.block_size;
   CHECK_NE(block, 0) << "block_size must be a positive integer value";
   CHECK_NE(in_shape[0], 0)
@@ -2404,14 +2760,14 @@ inline bool SpaceToDepthOpShape(const nnvm::NodeAttrs& attrs,
 
   expected_out[0] = in_shape[0];
   expected_out[1] = in_shape[1] * block * block;
-  uint32_t i = 2;
+  int i = 2;
   while (i < expected_out.ndim()) {
     expected_out[i] = in_shape[i] / block;
     ++i;
   }
 
   SHAPE_ASSIGN_CHECK(*out_attrs, 0, expected_out);
-  return true;
+  return shape_is_known(expected_out);
 }
 
 inline bool SpaceToDepthOpType(const nnvm::NodeAttrs& attrs,
@@ -2549,14 +2905,31 @@ struct SplitParam : public dmlc::Parameter<SplitParam> {
     DMLC_DECLARE_FIELD(sections).set_default(0)
     .describe("Number of sections if equally splitted. Default to 0 which means split by indices.");
   }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream indices_s, axis_s, squeeze_axis_s, sections_s;
+    indices_s << indices;
+    axis_s << axis;
+    squeeze_axis_s << squeeze_axis;
+    sections_s << sections;
+    (*dict)["indices"] = indices_s.str();
+    (*dict)["axis"] = axis_s.str();
+    (*dict)["squeeze_axis"] = squeeze_axis_s.str();
+    (*dict)["sections"] = sections_s.str();
+  }
 };  // struct SplitParam
 
 inline mxnet::TShape GetSplitIndices(const mxnet::TShape& ishape, int axis, int sections) {
-  mxnet::TShape indices(sections+1);
+  mxnet::TShape indices(sections+1, -1);
   indices[0] = 0;
-  int64_t section_size = ishape[axis] / sections;
+  int64_t section_size_b = (int64_t) (ishape[axis] / sections);
+  int64_t section_size_a = section_size_b + 1;
+  int section_a = ishape[axis] % sections;
   for (int i = 0; i < sections; ++i) {
-    indices[i+1] = section_size * (i + 1);
+    if ( i < section_a ) {
+      indices[i+1] = section_size_a * (i + 1);
+    } else {
+      indices[i+1] = section_size_b + indices[i];
+    }
   }
   return indices;
 }
@@ -2576,41 +2949,35 @@ inline bool SplitOpType(const nnvm::NodeAttrs& attrs,
   return true;
 }
 
-inline bool SplitOpShape(const nnvm::NodeAttrs& attrs,
-                         mxnet::ShapeVector* in_attrs,
-                         mxnet::ShapeVector* out_attrs) {
+inline bool SplitOpShapeImpl(const nnvm::NodeAttrs& attrs,
+                             mxnet::ShapeVector* in_attrs,
+                             mxnet::ShapeVector* out_attrs,
+                             const int real_axis) {
   using namespace mshadow;
   const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
-  CHECK_EQ(in_attrs->size(), 1U);
   mxnet::TShape dshape = in_attrs->at(split_enum::kData);
   mxnet::TShape ishape = in_attrs->at(split_enum::kData);
-  if (dshape.ndim() == 0) return false;
-  if (param.axis >= 0) {
-    CHECK_LT(static_cast<size_t>(param.axis), dshape.ndim());
-  } else {
-    CHECK_LT(param.axis + dshape.ndim(), dshape.ndim());
-  }
-  int real_axis = param.axis;
-  if (real_axis < 0) {
-    real_axis += dshape.ndim();
-  }
   const mxnet::TShape indices =
     (param.sections > 0) ? GetSplitIndices(ishape, real_axis, param.sections) : param.indices;
   int num_outputs = (param.sections > 0) ? indices.ndim() - 1 : indices.ndim();
   // Pre-compute squeezed output shape for future usage
   mxnet::TShape squeezed_dshape = dshape;
-  for (int d = real_axis; d < static_cast<int>(squeezed_dshape.ndim()) - 1; ++d) {
+  for (int d = real_axis; d < squeezed_dshape.ndim() - 1; ++d) {
     squeezed_dshape[d] = squeezed_dshape[d+1];
   }
   squeezed_dshape = mxnet::TShape(&squeezed_dshape[0], &squeezed_dshape[squeezed_dshape.ndim()-1]);
   // Assign shape to every output
   for (int i = 0; i < num_outputs; ++i) {
-    int start = indices[i];
-    int end = (i < num_outputs - 1) ? indices[i + 1] : ishape[real_axis];
-    CHECK(start < end)
-      << "start " << start << " is not less than end " << end << "for subarray " << i;
-    CHECK(end <= ishape[real_axis])
-      << "end " << end << " is no less than the size of the axis " << ishape[real_axis];
+    index_t start = indices[i];
+    index_t end = (i < num_outputs - 1) ? indices[i + 1] : ishape[real_axis];
+    if (ishape[real_axis] == 0U) {
+      end = start;
+    } else {
+      CHECK(start <= end)
+        << "start " << start << " is not less than end " << end << "for subarray " << i;
+      CHECK(end <= ishape[real_axis])
+        << "end " << end << " is no less than the size of the axis " << ishape[real_axis];
+    }
     dshape[real_axis] = (end - start);
     if (param.squeeze_axis) {
       CHECK_EQ(end - start, 1U) << "expected axis size of 1 but got " << end - start;
@@ -2631,7 +2998,7 @@ inline bool SplitOpShape(const nnvm::NodeAttrs& attrs,
       back_calculate_dshape[real_axis] += (*out_attrs)[i][real_axis];
     }
   }
-  for (int d = real_axis + 1; d < static_cast<int>(ishape.ndim()); ++d) {
+  for (int d = real_axis + 1; d < ishape.ndim(); ++d) {
     if (param.squeeze_axis) {
       back_calculate_dshape[d] = (*out_attrs)[0][d - 1];
     } else {
@@ -2640,6 +3007,26 @@ inline bool SplitOpShape(const nnvm::NodeAttrs& attrs,
   }
   SHAPE_ASSIGN_CHECK(*in_attrs, split_enum::kData, back_calculate_dshape);
   return true;
+}
+
+inline bool SplitOpShape(const nnvm::NodeAttrs& attrs,
+                         mxnet::ShapeVector* in_attrs,
+                         mxnet::ShapeVector* out_attrs) {
+  using namespace mshadow;
+  const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
+  CHECK_EQ(in_attrs->size(), 1U);
+  mxnet::TShape dshape = in_attrs->at(split_enum::kData);
+  if (!mxnet::ndim_is_known(dshape)) return false;
+  if (param.axis >= 0) {
+    CHECK_LT(param.axis, dshape.ndim());
+  } else {
+    CHECK_LT(param.axis + dshape.ndim(), dshape.ndim());
+  }
+  int real_axis = param.axis;
+  if (real_axis < 0) {
+    real_axis += dshape.ndim();
+  }
+  return SplitOpShapeImpl(attrs, in_attrs, out_attrs, real_axis);
 }
 
 struct SplitKernel {
@@ -2707,24 +3094,19 @@ struct ConcatenateKernel {
 };
 
 template<typename xpu>
-inline void SplitOpForward(const nnvm::NodeAttrs& attrs,
-                           const OpContext& ctx,
-                           const std::vector<TBlob>& inputs,
-                           const std::vector<OpReqType>& req,
-                           const std::vector<TBlob>& outputs) {
+inline void SplitOpForwardImpl(const nnvm::NodeAttrs& attrs,
+                               const OpContext& ctx,
+                               const std::vector<TBlob>& inputs,
+                               const std::vector<OpReqType>& req,
+                               const std::vector<TBlob>& outputs,
+                               const int real_axis) {
   using namespace mshadow;
   using namespace mshadow::expr;
   using namespace mxnet_op;
   const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
-  CHECK_EQ(inputs.size(), 1U);
-  CHECK_EQ(outputs.size(), (param.sections > 0) ? param.sections : param.indices.ndim());
   Stream<xpu> *s = ctx.get_stream<xpu>();
   const TBlob& input_data = inputs[split_enum::kData];
   size_t leading = 1, trailing = 1;
-  int real_axis = param.axis;
-  if (real_axis < 0) {
-    real_axis += input_data.ndim();
-  }
   CHECK_LT(real_axis, input_data.ndim());
   size_t mid = input_data.shape_[real_axis];
   for (int i = 0; i < real_axis; ++i) {
@@ -2770,25 +3152,39 @@ inline void SplitOpForward(const nnvm::NodeAttrs& attrs,
 }
 
 template<typename xpu>
-inline void SplitOpBackward(const nnvm::NodeAttrs& attrs,
-                            const OpContext& ctx,
-                            const std::vector<TBlob>& inputs,
-                            const std::vector<OpReqType>& req,
-                            const std::vector<TBlob>& outputs) {
+inline void SplitOpForward(const nnvm::NodeAttrs& attrs,
+                           const OpContext& ctx,
+                           const std::vector<TBlob>& inputs,
+                           const std::vector<OpReqType>& req,
+                           const std::vector<TBlob>& outputs) {
   using namespace mshadow;
   using namespace mshadow::expr;
   using namespace mxnet_op;
   const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
-  CHECK_EQ(inputs.size(), (param.sections > 0) ? param.sections : param.indices.ndim())
-    << "out grad vector size mush match the output size";
-  CHECK_EQ(outputs.size(), 1U);
+  CHECK_EQ(inputs.size(), 1U);
+  CHECK_EQ(outputs.size(), (param.sections > 0) ? param.sections : param.indices.ndim());
+  const TBlob& input_data = inputs[split_enum::kData];
+  int real_axis = param.axis;
+  if (real_axis < 0) {
+    real_axis += input_data.ndim();
+  }
+  SplitOpForwardImpl<xpu>(attrs, ctx, inputs, req, outputs, real_axis);
+}
+
+template<typename xpu>
+inline void SplitOpBackwardImpl(const nnvm::NodeAttrs& attrs,
+                                const OpContext& ctx,
+                                const std::vector<TBlob>& inputs,
+                                const std::vector<OpReqType>& req,
+                                const std::vector<TBlob>& outputs,
+                                const int real_axis) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mxnet_op;
+  const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
   Stream<xpu> *s = ctx.get_stream<xpu>();
   TBlob input_grad = outputs[split_enum::kData];
   size_t leading = 1, trailing = 1;
-  int real_axis = param.axis;
-  if (real_axis < 0) {
-      real_axis += input_grad.ndim();
-  }
   CHECK_LT(real_axis, input_grad.ndim());
   size_t mid = input_grad.shape_[real_axis];
   for (int i = 0; i < real_axis; ++i) {
@@ -2833,6 +3229,26 @@ inline void SplitOpBackward(const nnvm::NodeAttrs& attrs,
   });
 }
 
+template<typename xpu>
+inline void SplitOpBackward(const nnvm::NodeAttrs& attrs,
+                            const OpContext& ctx,
+                            const std::vector<TBlob>& inputs,
+                            const std::vector<OpReqType>& req,
+                            const std::vector<TBlob>& outputs) {
+  using namespace mshadow;
+  using namespace mshadow::expr;
+  using namespace mxnet_op;
+  const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
+  CHECK_EQ(inputs.size(), (param.sections > 0) ? param.sections : param.indices.ndim())
+    << "out grad vector size mush match the output size";
+  CHECK_EQ(outputs.size(), 1U);
+  int real_axis = param.axis;
+  if (real_axis < 0) {
+      real_axis += outputs[split_enum::kData].ndim();
+  }
+  SplitOpBackwardImpl<xpu>(attrs, ctx, inputs, req, outputs, real_axis);
+}
+
 inline uint32_t SplitNumOutputs(const NodeAttrs& attrs) {
   const SplitParam& param = nnvm::get<SplitParam>(attrs.parsed);
   return (param.sections > 0) ? param.sections : param.indices.ndim();
@@ -2840,5 +3256,38 @@ inline uint32_t SplitNumOutputs(const NodeAttrs& attrs) {
 
 }  // namespace op
 }  // namespace mxnet
+
+namespace std {
+template<>
+struct hash<mxnet::op::TransposeParam> {
+  size_t operator()(const mxnet::op::TransposeParam& val) {
+    size_t ret = 0;
+    ret = dmlc::HashCombine(ret, val.axes);
+    return ret;
+  }
+};
+
+template<>
+struct hash<mxnet::op::ReshapeParam> {
+  size_t operator()(const mxnet::op::ReshapeParam& val) {
+    size_t ret = 0;
+    ret = dmlc::HashCombine(ret, val.target_shape);
+    ret = dmlc::HashCombine(ret, val.keep_highest);
+    ret = dmlc::HashCombine(ret, val.shape);
+    ret = dmlc::HashCombine(ret, val.reverse);
+    return ret;
+  }
+};
+
+template<>
+struct hash<mxnet::op::ExpandDimParam> {
+  size_t operator()(const mxnet::op::ExpandDimParam& val) {
+    size_t ret = 0;
+    ret = dmlc::HashCombine(ret, val.axis);
+    return ret;
+  }
+};
+
+}  // namespace std
 
 #endif  // MXNET_OPERATOR_TENSOR_MATRIX_OP_INL_H_

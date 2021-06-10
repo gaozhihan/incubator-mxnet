@@ -16,19 +16,20 @@
 # under the License.
 
 # coding: utf-8
-# pylint: disable=invalid-name, protected-access, too-many-arguments, no-self-use, too-many-locals, broad-except, too-many-lines
+# pylint: disable=invalid-name, protected-access, too-many-arguments, no-self-use, too-many-locals, broad-except, too-many-lines, unnecessary-pass
 """numpy interface for operators."""
-from __future__ import absolute_import
 
 import traceback
 import warnings
+import collections
 
 from array import array
 from threading import Lock
+import ctypes
 from ctypes import CFUNCTYPE, POINTER, Structure, pointer
 from ctypes import c_void_p, c_int, c_char, c_char_p, cast, c_bool
 
-from .base import _LIB, check_call, MXCallbackList, c_array, c_array_buf
+from .base import _LIB, check_call, MXCallbackList, c_array, c_array_buf, mx_int, OpHandle
 from .base import c_str, mx_uint, mx_float, ctypes2numpy_shared, NDArrayHandle, py_str
 from . import symbol, context
 from .ndarray import NDArray, _DTYPE_NP_TO_MX, _DTYPE_MX_TO_NP
@@ -36,8 +37,11 @@ from .ndarray.ndarray import _STORAGE_TYPE_STR_TO_ID, _STORAGE_TYPE_ID_TO_STR
 from .ndarray.ndarray import _STORAGE_TYPE_UNDEFINED, _STORAGE_TYPE_DEFAULT
 from .ndarray.ndarray import _STORAGE_TYPE_CSR, _STORAGE_TYPE_ROW_SPARSE
 from .ndarray import _ndarray_cls
+from .numpy.multiarray import _np_ndarray_cls
+from .util import is_np_array
 
 c_int_p = POINTER(c_int)
+
 
 class PythonOp(object):
     """Base class for operators implemented in Python.
@@ -147,6 +151,7 @@ class PythonOp(object):
         """
         return self.need_top_grad_
 
+
 class NumpyOp(PythonOp):
     """Base class for numpy operators. numpy operators allow parts
     of computation in symbolic graph to be writen in numpy. This feature
@@ -164,8 +169,9 @@ class NumpyOp(PythonOp):
         fb_functype = CFUNCTYPE(None, c_int, POINTER(POINTER(mx_float)), POINTER(c_int),
                                 POINTER(POINTER(mx_uint)), POINTER(c_int), c_void_p)
         infer_functype = CFUNCTYPE(None, c_int, POINTER(c_int),
-                                   POINTER(POINTER(mx_uint)), c_void_p)
+                                   POINTER(POINTER(mx_int)), c_void_p)
         list_functype = CFUNCTYPE(None, POINTER(POINTER(POINTER(c_char))), c_void_p)
+
         class NumpyOpInfo(Structure):
             """Structure that holds Callback information. Passed to NumpyOpProp"""
             _fields_ = [
@@ -180,6 +186,7 @@ class NumpyOp(PythonOp):
                 ('p_list_outputs', c_void_p),
                 ('p_list_arguments', c_void_p),
                 ]
+
         def forward_entry(num_tensor, tensor_ptrs, tensor_dims,
                           tensor_shapes, tensor_tags, _):
             """C Callback for NumpyOp::Forward"""
@@ -214,9 +221,9 @@ class NumpyOp(PythonOp):
             assert len(ishape) == n_in
             rshape = list(ishape) + list(oshape)
             for i in range(n_in+n_out):
-                tensor_shapes[i] = cast(c_array_buf(mx_uint,
-                                                    array('I', rshape[i])),
-                                        POINTER(mx_uint))
+                tensor_shapes[i] = cast(c_array_buf(mx_int,
+                                                    array('i', rshape[i])),
+                                        POINTER(mx_int))
                 tensor_dims[i] = len(rshape[i])
 
         def list_outputs_entry(out, _):
@@ -232,7 +239,6 @@ class NumpyOp(PythonOp):
             ret = [c_str(i) for i in ret] + [c_char_p(0)]
             ret = c_array(c_char_p, ret)
             out[0] = cast(ret, POINTER(POINTER(c_char)))
-
 
         self.info_ = NumpyOpInfo(fb_functype(forward_entry),
                                  fb_functype(backward_entry),
@@ -250,6 +256,7 @@ class NumpyOp(PythonOp):
         PythonOp._ref_holder.append(self)
         return sym
 
+
 class NDArrayOp(PythonOp):
     """Base class for numpy operators. numpy operators allow parts
     of computation in symbolic graph to be writen in numpy. This feature
@@ -266,7 +273,7 @@ class NDArrayOp(PythonOp):
     def get_symbol(self, *args, **kwargs):
         fb_functype = CFUNCTYPE(c_bool, c_int, POINTER(c_void_p), POINTER(c_int), c_void_p)
         infer_functype = CFUNCTYPE(c_bool, c_int, POINTER(c_int),
-                                   POINTER(POINTER(mx_uint)), c_void_p)
+                                   POINTER(POINTER(mx_int)), c_void_p)
         list_functype = CFUNCTYPE(c_bool, POINTER(POINTER(POINTER(c_char))), c_void_p)
         deps_functype = CFUNCTYPE(c_bool, c_int_p, c_int_p, c_int_p,
                                   c_int_p, POINTER(c_int_p), c_void_p)
@@ -335,9 +342,9 @@ class NDArrayOp(PythonOp):
                 assert len(ishape) == n_in
                 rshape = list(ishape) + list(oshape)
                 for i in range(n_in+n_out):
-                    tensor_shapes[i] = cast(c_array_buf(mx_uint,
-                                                        array('I', rshape[i])),
-                                            POINTER(mx_uint))
+                    tensor_shapes[i] = cast(c_array_buf(mx_int,
+                                                        array('i', rshape[i])),
+                                            POINTER(mx_int))
                     tensor_dims[i] = len(rshape[i])
             except Exception:
                 print('Error in NDArrayOp.infer_shape: %s' % traceback.format_exc())
@@ -423,6 +430,7 @@ class NDArrayOp(PythonOp):
         deps.extend(out_data)
         return deps
 
+
 class CustomOp(object):
     """Base class for operators implemented in python"""
     def __init__(self):
@@ -465,9 +473,16 @@ class CustomOp(object):
         if req == 'null':
             return
         elif req in ('write', 'inplace'):
-            dst[:] = src
+            if is_np_array():
+                dst[()] = src
+            else:
+                dst[:] = src
         elif req == 'add':
-            dst[:] += src
+            if is_np_array():
+                dst[()] += src
+            else:
+                dst[:] += src
+
 
 class CustomOpProp(object):
     """Base class for operator property class implemented in python.
@@ -671,6 +686,7 @@ class CustomOpProp(object):
         # pylint: disable=W0613
         return CustomOp()
 
+
 class _Registry(object):
     """CustomOp registry."""
     def __init__(self):
@@ -687,7 +703,9 @@ class _Registry(object):
         self.lock.release()
         return cur
 
+
 _registry = _Registry()
+
 
 def register(reg_name):
     """Register a subclass of CustomOpProp to the registry with name reg_name."""
@@ -698,7 +716,7 @@ def register(reg_name):
         del_functype = CFUNCTYPE(c_int, c_void_p)
 
         infershape_functype = CFUNCTYPE(c_int, c_int, POINTER(c_int),
-                                        POINTER(POINTER(mx_uint)), c_void_p)
+                                        POINTER(POINTER(mx_int)), c_void_p)
         infertype_functype = CFUNCTYPE(c_int, c_int, POINTER(c_int), c_void_p)
         inferstorage_functype = CFUNCTYPE(c_int, c_int, POINTER(c_int), c_void_p)
         inferstorage_backward_functype = CFUNCTYPE(c_int, c_int, POINTER(c_int), \
@@ -710,11 +728,18 @@ def register(reg_name):
                                       POINTER(c_int), POINTER(c_int),
                                       POINTER(MXCallbackList), c_void_p)
         req_enum = ('null', 'write', 'inplace', 'add')
+        create_ndarray_fn = _np_ndarray_cls if is_np_array() else _ndarray_cls
 
         def creator(op_type, argc, keys, vals, ret):
             """internal function"""
             assert py_str(op_type) == reg_name
-            kwargs = dict([(py_str(keys[i]), py_str(vals[i])) for i in range(argc)])
+            kwargs = {}
+            for i in range(argc):
+                key = py_str(keys[i])
+                if key not in ['__ctx_group__', '__lr_mult__', '__wd_mult__',
+                               '__force_mirroring__',
+                               '__mirror_stage__', '__profiler_scope__']:
+                    kwargs[key] = py_str(vals[i])
             op_prop = prop_cls(**kwargs)
 
             def infer_shape_entry(num_tensor, tensor_dims,
@@ -747,9 +772,9 @@ def register(reg_name):
                         "shapes, got %d."%(n_aux, len(ashape))
                     rshape = list(ishape) + list(oshape) + list(ashape)
                     for i in range(n_in+n_out+n_aux):
-                        tensor_shapes[i] = cast(c_array_buf(mx_uint,
-                                                            array('I', rshape[i])),
-                                                POINTER(mx_uint))
+                        tensor_shapes[i] = cast(c_array_buf(mx_int,
+                                                            array('i', rshape[i])),
+                                                POINTER(mx_int))
                         tensor_dims[i] = len(rshape[i])
 
                     infer_shape_entry._ref_holder = [tensor_shapes]
@@ -757,7 +782,6 @@ def register(reg_name):
                     print('Error in %s.infer_shape: %s' % (reg_name, traceback.format_exc()))
                     return False
                 return True
-
 
             def infer_storage_type_backward_entry(num_tensor, tensor_stypes, tags, _):
                 # pylint: disable=C0301
@@ -973,13 +997,13 @@ def register(reg_name):
                             tensors = [[] for i in range(5)]
                             for i in range(num_ndarray):
                                 if tags[i] == 1 or tags[i] == 4:
-                                    tensors[tags[i]].append(_ndarray_cls(cast(ndarraies[i],
-                                                                              NDArrayHandle),
-                                                                         writable=True))
+                                    tensors[tags[i]].append(
+                                        create_ndarray_fn(cast(ndarraies[i], NDArrayHandle), writable=True)
+                                    )
                                 else:
-                                    tensors[tags[i]].append(_ndarray_cls(cast(ndarraies[i],
-                                                                              NDArrayHandle),
-                                                                         writable=False))
+                                    tensors[tags[i]].append(
+                                        create_ndarray_fn(cast(ndarraies[i], NDArrayHandle), writable=False)
+                                    )
                             reqs = [req_enum[reqs[i]] for i in range(len(tensors[1]))]
                             with ctx:
                                 op.forward(is_train=is_train, req=reqs,
@@ -1009,15 +1033,15 @@ def register(reg_name):
                                     # be set to default
                                     stype = _STORAGE_TYPE_DEFAULT
                                 if tags[i] == 2 or tags[i] == 4:
-                                    tensors[tags[i]].append(_ndarray_cls(cast(ndarraies[i],
-                                                                              NDArrayHandle),
-                                                                         writable=True,
-                                                                         stype=stype))
+                                    tensors[tags[i]].append(
+                                        create_ndarray_fn(cast(ndarraies[i], NDArrayHandle),
+                                                          writable=True, stype=stype)
+                                    )
                                 else:
-                                    tensors[tags[i]].append(_ndarray_cls(cast(ndarraies[i],
-                                                                              NDArrayHandle),
-                                                                         writable=False,
-                                                                         stype=stype))
+                                    tensors[tags[i]].append(
+                                        create_ndarray_fn(cast(ndarraies[i], NDArrayHandle),
+                                                          writable=False, stype=stype)
+                                    )
                             reqs = [req_enum[reqs[i]] for i in range(len(tensors[2]))]
                             with ctx:
                                 op.backward(req=reqs,
@@ -1098,4 +1122,90 @@ def register(reg_name):
         return prop_cls
     return do_register
 
+
 register("custom_op")(CustomOpProp)
+
+
+def get_all_registered_operators():
+    """Get all registered MXNet operator names.
+
+    Returns
+    -------
+    operator_names : list of string
+    """
+    plist = ctypes.POINTER(ctypes.c_char_p)()
+    size = ctypes.c_uint()
+
+    check_call(_LIB.MXListAllOpNames(ctypes.byref(size),
+                                     ctypes.byref(plist)))
+
+    mx_registered_operator_names = [py_str(plist[i]) for i in range(size.value)]
+    return mx_registered_operator_names
+
+
+def get_all_registered_operators_grouped():
+    """Get all registered MXNet operator names, grouped by 'original' operator.
+
+    Returns
+    -------
+    names : a dictionary, mapping op name to the list of all its aliases (including the original).
+    """
+    ret = {}
+    for aname in get_all_registered_operators():
+        op_handle = OpHandle()
+        check_call(_LIB.NNGetOpHandle(c_str(aname), ctypes.byref(op_handle)))
+        name = ctypes.c_char_p()
+        desc = ctypes.c_char_p()
+        num_args = mx_uint()
+        arg_names = ctypes.POINTER(ctypes.c_char_p)()
+        arg_types = ctypes.POINTER(ctypes.c_char_p)()
+        arg_descs = ctypes.POINTER(ctypes.c_char_p)()
+        ret_types = ctypes.POINTER(ctypes.c_char_p)()
+        check_call(_LIB.NNGetOpInfo(op_handle, ctypes.byref(name), ctypes.byref(desc),
+                                    ctypes.byref(num_args), ctypes.byref(arg_names),
+                                    ctypes.byref(arg_types), ctypes.byref(arg_descs),
+                                    ctypes.byref(ret_types)))
+        ret.setdefault(py_str(name.value), []).append(aname)
+    return ret
+
+
+OperatorArguments = collections.namedtuple('OperatorArguments', ['narg', 'names', 'types'])
+
+
+def get_operator_arguments(op_name):
+    """Given operator name, fetch operator arguments - number of arguments,
+    argument names, argument types.
+
+    Parameters
+    ----------
+    op_name: str
+        Handle for the operator
+
+    Returns
+    -------
+    operator_arguments : OperatorArguments, namedtuple with number of arguments, names and types
+    """
+    op_handle = OpHandle()
+    check_call(_LIB.NNGetOpHandle(c_str(op_name), ctypes.byref(op_handle)))
+    real_name = ctypes.c_char_p()
+    desc = ctypes.c_char_p()
+    num_args = mx_uint()
+    arg_names = ctypes.POINTER(ctypes.c_char_p)()
+    arg_types = ctypes.POINTER(ctypes.c_char_p)()
+    arg_descs = ctypes.POINTER(ctypes.c_char_p)()
+    key_var_num_args = ctypes.c_char_p()
+    ret_type = ctypes.c_char_p()
+
+    check_call(_LIB.MXSymbolGetAtomicSymbolInfo(
+        op_handle, ctypes.byref(real_name), ctypes.byref(desc),
+        ctypes.byref(num_args),
+        ctypes.byref(arg_names),
+        ctypes.byref(arg_types),
+        ctypes.byref(arg_descs),
+        ctypes.byref(key_var_num_args),
+        ctypes.byref(ret_type)))
+
+    narg = int(num_args.value)
+    arg_names = [py_str(arg_names[i]) for i in range(narg)]
+    arg_types = [py_str(arg_types[i]) for i in range(narg)]
+    return OperatorArguments(narg, arg_names, arg_types)

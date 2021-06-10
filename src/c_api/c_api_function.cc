@@ -42,11 +42,11 @@ struct CustomFunctionParam {
 };
 
 std::vector<nnvm::NodeEntry> Gradient(
-    const nnvm::NodePtr& n,
+    const nnvm::ObjectPtr& n,
     const std::vector<nnvm::NodeEntry>& out_grads) {
   const CustomFunctionParam& params = nnvm::get<CustomFunctionParam>(n->attrs.parsed);
 
-  nnvm::NodePtr g = nnvm::Node::Create();
+  nnvm::ObjectPtr g = nnvm::Node::Create();
   g->attrs.op = nnvm::Op::Get("_backward_CustomFunction");
   g->attrs.name = n->attrs.name + "_backward";
   g->attrs.parsed = params;
@@ -56,7 +56,7 @@ std::vector<nnvm::NodeEntry> Gradient(
 
   std::vector<nnvm::NodeEntry> ret;
   for (uint32_t i = 0; i < g->num_outputs(); ++i) {
-    ret.emplace_back(nnvm::NodeEntry{g, i, 0});
+    ret.emplace_back(g, i, 0);
   }
 
   return ret;

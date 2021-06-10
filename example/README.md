@@ -52,13 +52,13 @@ If you have a tutorial idea for the website, download the [Jupyter notebook tuto
 
 #### Tutorial location
 
-Notebook tutorials should be submitted in the `docs/tutorials` folder, so that they maybe rendered in the [web site's tutorial section](https://mxnet.incubator.apache.org/tutorials/index.html).
+Notebook tutorials should be submitted in the `docs/tutorials` folder, so that they maybe rendered in the [web site's tutorial section](https://mxnet.apache.org/tutorials/index.html).
 
 Do not forget to udpdate the `docs/tutorials/index.md` for your tutorial to show up on the website.
 
 #### Tutorial formatting
 
-The site expects the format to be markdown, so export your notebook as a .md via the Jupyter web interface menu (File > Download As > Markdown). Then, to enable the download notebook button in the web site's UI ([example](https://mxnet.incubator.apache.org/tutorials/python/linear-regression.html)), add the following as the last line of the file ([example](https://github.com/apache/incubator-mxnet/blame/master/docs/tutorials/python/linear-regression.md#L194)):
+The site expects the format to be markdown, so export your notebook as a .md via the Jupyter web interface menu (File > Download As > Markdown). Then, to enable the download notebook button in the web site's UI ([example](https://mxnet.apache.org/tutorials/python/linear-regression.html)), add the following as the last line of the file ([example](https://github.com/apache/incubator-mxnet/blame/master/docs/tutorials/python/linear-regression.md#L194)):
 
 ```
 <!-- INSERT SOURCE DOWNLOAD BUTTONS -->
@@ -84,75 +84,36 @@ If your tutorial depends on specific packages, simply add them to this provision
 
 ### <a name="language-binding-examples"></a>Languages Binding Examples
 ------------------
-* [MXNet C++ API](http://mxnet.incubator.apache.org/api/c++/index.html)
+* [MXNet C++ API](https://mxnet.apache.org/api/c++/index.html)
    - [C++ examples](https://github.com/apache/incubator-mxnet/tree/master/example/image-classification/predict-cpp) - Example code for using C++ interface, including NDArray, symbolic layer and models.
-* [MXNet Python API](http://mxnet.incubator.apache.org/api/python/index.html)
-* [MXNet Java API](http://mxnet.incubator.apache.org/api/java/index.html)
-* [MXNet Scala API](http://mxnet.incubator.apache.org/api/scala/index.html)
-* [MXNet R API](http://mxnet.incubator.apache.org/api/r/index.html)
-* [MXNet Julia API](http://mxnet.incubator.apache.org/api/julia/index.html)
-* [MXNet Perl API](https://mxnet.incubator.apache.org/api/perl/index.html)
+* [MXNet Python API](https://mxnet.apache.org/api/python/index.html)
+* [MXNet Java API](https://mxnet.apache.org/api/java/index.html)
+* [MXNet Scala API](https://mxnet.apache.org/api/scala/index.html)
+* [MXNet R API](https://mxnet.apache.org/api/r/index.html)
+* [MXNet Julia API](https://mxnet.apache.org/api/julia/index.html)
+* [MXNet Perl API](https://mxnet.apache.org/api/perl/index.html)
 * [go-mxnet-predictor](https://github.com/songtianyi/go-mxnet-predictor) - Go binding for inference
-* [MXNet JNI](https://github.com/dmlc/mxnet/tree/master/amalgamation/jni) - JNI(Android) library
-* [MXNet Amalgamation](https://github.com/dmlc/mxnet/tree/master/amalgamation) - Amalgamation (entire library in a single file)
 * [MXNet Javascript](https://github.com/dmlc/mxnet.js/) - MXNetJS: Javascript Package for Deep Learning in Browser (without server)
 
 ### <a name="deep-learning-examples-mxnet"></a>Deep Learning Examples in the MXNet Project Repository
 --------------
 * [Autoencoder](autoencoder) - unsupervised feature learning
-* [Bayesian Methods](bayesian-methods) - various examples related to Bayesian Methods
-* [Bidirectional LSTM Sorting](bi-lstm-sort) - use a bidirectional LSTM to sort an array
-* [Caffe](caffe) - how to call Caffe operators from MXNet
-* [CNN for Chinese Text Classification](cnn_chinese_text_classification) - a MXnet example for Chinese text classification
-* [CNN for Text Classification](cnn_text_classification) - a MXnet example for text classification
-* [CTC with MXNet](ctc) - a modification of warpctc
-* [Deep Embedded Clustering](deep-embedded-clustering) - unsupervised deep embedding for clustering analysis
-* [Dense-Sparse-Dense Training](dsd) - Dense-Sparse-Dense Training for deep neural networks
-* [Fully Convolutional Networks](fcn-xs) - fully convolutional networks for semantic segmentation
-* [Generative Adversarial Networks with R](gan/CGAN_mnist_R) - GAN examples in R
 * [Gluon Examples](gluon) - several examples using the Gluon API
   * [Style Transfer](gluon/style_transfer) - a style transfer example using gluon
   * [Word Language Model](gluon/word_language_model) - an example that trains a multi-layer RNN on the Penn Treebank language modeling benchmark
   * [SN-GAN](gluon/sn_gan) - an example that utilizes spectral normalization to train GAN(Generative adversarial network) using Gluon API
 * [Image Classification with R](image-classification) - image classification on MNIST,CIFAR,ImageNet-1k,ImageNet-Full, with multiple GPU and distributed training.
-* [Kaggle 1st national data science bowl](kaggle-ndsb1) - a MXnet example for Kaggle Nation Data Science Bowl 1
 * [Kaggle 2nd national data science bowl](kaggle-ndsb2) - a tutorial for Kaggle Second Nation Data Science Bowl
-* [Memory Cost](memcost) - a script to show the memory cost of different allocation strategies
-* [Model Parallelism](model-parallel) - various model parallelism examples
-    * [Model Parallelism with LSTM](model-parallel/lstm) - an example showing how to do model parallelism with a LSTM
-    * [Model Parallelism with Matrix Factorization](model-parallel/lstm) - a matrix factorization algorithm for recommendations
-* [Module API](module) - examples with the Python Module API
 * [Multi-task Learning](multi-task) - how to use MXNet for multi-task learning
-* [MXNet Adversarial Variational Autoencoder](mxnet_adversarial_vae) - combines a variational autoencoder with a generative adversarial network
-* [Noise-contrastive estimation loss](nce-loss) - used to speedup multi-class classification
-* [Neural Style](neural-style) - use deep learning for style transfer in images
-* [Numpy Operator Customization](numpy-ops) - Examplea on quick customize new ops with Numpy
 * [Profiling](profiler) - generate profiling results in json files
-* [Python How To](python-howto) - a variety of Python examples
-* [Quantization and Calibration Examples](quantization) - examples of quantizing a FP32 model to INT8 and performing low-precision inference with Intel MKL-DNN on CPU or cuDNN on GPU
-* [R-CNN](rcnn) - R-CNN with distributed implementation and data parallelization
+* [Quantization and Calibration Examples](quantization) - examples of quantizing a FP32 model to INT8 and performing low-precision inference with Intel ONEDNN on CPU or cuDNN on GPU
 * [Recommender Systems](recommenders) - examples of how to build various kinds of recommender systems
-* [Reinforcement Learning](reinforcement-learning) - a variety of reinforcement learning examples
-    * [A3C](reinforcement-learning/a3c)
-    * [DDPG](reinforcement-learning/ddpg) - example of training DDPG for CartPole
-    * [DQN](reinforcement-learning/dqn) - examples of training DQN and Double DQN to play Atari Games
-    * [Parallel Advantage-Actor Critic](reinforcement-learning/parallel_actor_critic)
 * [Restricted Boltzmann Machine](restricted-boltzmann-machine) - an example of the binary restricted Boltzmann machine learning MNIST
-* [RNN Time Major](rnn-time-major) - RNN implementation with Time-major layout
-* [Recurrent Neural Net](rnn) - creating recurrent neural networks models using high level `mxnet.rnn` interface
-* [Sparse](sparse) - a variety of sparse examples
-    * [Factorization Machine](sparse/factorization_machine)
-    * [Linear Classification](sparse/linear_classification)
-    * [Matrix Factorization](sparse/matrix_factorization)
-    * [Wide Deep](sparse/wide_deep)
 * [Single Shot MultiBox Detector](ssd) - SSD object recognition example
-* [Stochastic Depth](stochastic-depth) - implementation of the stochastic depth algorithm
-* [Support Vector Machine](svm_mnist) - an SVM example using MNIST
-* [Variational Auto Encoder](vae) - implements the Variational Auto Encoder in MXNet using MNIST
 
 ### <a name="deep-learning-examples-other"></a>Other Deep Learning Examples with MXNet
 
-* [Face Recognition with ArcFace](https://github.com/onnx/models/tree/master/models/face_recognition/ArcFace) - ONNX model for face recognition with notebooks for training, validating and running inference in MXNet by [abhinavs95](https://github.com/abhinavs95)
+* [Face Recognition with ArcFace](https://github.com/onnx/models/tree/master/vision/body_analysis/arcface) - ONNX model for face recognition with notebooks for training, validating and running inference in MXNet by [abhinavs95](https://github.com/abhinavs95)
 * [Chinese plate recognition](https://github.com/imistyrain/mxnet-mr) - Recognize Chinese vehicle plate, by [imistyrain](https://github.com/imistyrain)
 * [Fast R-CNN](https://github.com/precedenceguo/mx-rcnn) by [Jian Guo](https://github.com/precedenceguo)
 * "End2End Captcha Recognition (OCR)" by [xlvector](https://github.com/xlvector) [github link](https://github.com/xlvector/learning-dl/tree/master/mxnet/ocr) [Blog in Chinese](http://blog.xlvector.net/2016-05/mxnet-ocr-cnn/)
@@ -172,7 +133,7 @@ If your tutorial depends on specific packages, simply add them to this provision
 * [MultiGPU enabled image generative models (GAN and DCGAN)](https://github.com/tqchen/mxnet-gan) by [Tianqi Chen](https://github.com/tqchen)
 * [Deep reinforcement learning for playing flappybird by mxnet](https://github.com/li-haoran/DRL-FlappyBird) by LIHaoran
 * [Neural Style in Markov Random Field (MRF) and Perceptual Losses Realtime transfer](https://github.com/zhaw/neural_style) by [zhaw](https://github.com/zhaw)
-* [MTCNN Face keypoints detection and alignment](https://pangyupo.github.io/2016/10/22/mxnet-mtcnn/) ([github](https://github.com/pangyupo/mxnet_mtcnn_face_detection)) in Chinese by [pangyupo](https://github.com/pangyupo)
+* [MTCNN Face keypoints detection and alignment](https://github.com/YYuanAnyVision/mxnet_mtcnn_face_detection) by [yuanyang](https://github.com/YYuanAnyVision), source code for [paper](https://kpzhang93.github.io/papers/spl.pdf) "Joint Face Detection and Alignment using Multi-task Cascaded Convolutional Neural Networks", [Kaipeng Zhang](https://github.com/kpzhang93), Zhanpeng Zhang, Zhifeng Li and Yu Qiao, IEEE Signal Processing Letters, 23(10), 2016
 * [SSD: Single Shot MultiBox Object Detector](https://github.com/zhreshold/mxnet-ssd) by [zhreshold](https://github.com/zhreshold)
 * [Fast Neural Style in Scala](https://github.com/Ldpe2G/DeepLearningForFun/tree/master/Mxnet-Scala/FastNeuralStyle) by [Ldpe2G](https://github.com/Ldpe2G)
 * [LSTM Human Activity Recognition](https://github.com/Ldpe2G/DeepLearningForFun/tree/master/Mxnet-Scala/HumanActivityRecognition) by [Ldpe2G](https://github.com/Ldpe2G)

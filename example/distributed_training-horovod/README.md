@@ -21,7 +21,7 @@ excellent scaling efficiency for dense models running on a large number of nodes
 supports mainstream deep learning frameworks such as MXNet, TensorFlow, Keras, and PyTorch. 
 It is created at Uber and currently hosted by the [Linux Foundation Deep Learning](https://lfdl.io)(LF DL). 
 
-MXNet is supported in Horovod 0.16.0 [release](https://eng.uber.com/horovod-pyspark-apache-mxnet-support/).
+MXNet is supported starting from Horovod 0.16.0 [release](https://eng.uber.com/horovod-pyspark-apache-mxnet-support/).
 
 ## What's New?
 Compared with the standard distributed training script in MXNet which uses parameter server to 
@@ -30,12 +30,13 @@ to communicate parameters between workers. There is no dedicated server and the 
 between workers does not depend on the number of workers. Therefore, it scales well in the case where 
 there are a large number of workers and network bandwidth is the bottleneck.
 
-# Install
+# Setup
+
 ## Install MXNet
 ```bash
 $ pip install mxnet
 ```
-**Note**: There is a [known issue](https://github.com/horovod/horovod/issues/884) when running Horovod with MXNet on a Linux system with GCC version 5.X and above. We recommend users to build MXNet from source following this [guide](https://mxnet.incubator.apache.org/install/build_from_source.html) as a workaround for now. Also mxnet-mkl package in 1.4.0 release does not support Horovod.
+**Note**: The [known issue](https://github.com/horovod/horovod/issues/884) when running Horovod with MXNet on a Linux system with GCC version 5.X and above has been resolved. Please use MXNet 1.4.1 or later releases with Horovod 0.16.2 or later releases to avoid the GCC incompatibility issue. MXNet 1.4.0 release works with Horovod 0.16.0 and 0.16.1 releases with the GCC incompatibility issue unsolved.
 
 ## Install Horovod
 ```bash
@@ -43,8 +44,8 @@ $ pip install horovod
 ```
 
 This basic installation is good for laptops and for getting to know Horovod.
-If you're installing Horovod on a server with GPUs, read the [Horovod on GPU](https://github.com/horovod/horovod/blob/master/docs/gpus.md) page.
-If you want to use Docker, read the [Horovod in Docker](https://github.com/horovod/horovod/blob/master/docs/docker.md) page.
+If you're installing Horovod on a server with GPUs, read the [Horovod on GPU](https://github.com/horovod/horovod/blob/master/docs/gpus.rst) page.
+If you want to use Docker, read the [Horovod in Docker](https://github.com/horovod/horovod/blob/master/docs/docker.rst) page.
 
 ## Install MPI
 MPI is required to run distributed training with Horovod. Install [Open MPI](https://www.open-mpi.org/) or another MPI implementation.
@@ -52,6 +53,10 @@ Steps to install Open MPI are listed [here](https://www.open-mpi.org/faq/?catego
 
 **Note**: Open MPI 3.1.3 has an issue that may cause hangs.  It is recommended
 to downgrade to Open MPI 3.1.2 or upgrade to Open MPI 4.0.0.
+
+## On Kubernetes
+
+Distributed MXNet jobs with Horovod can be submitted to a Kubernetes cluster via [Kubeflow MPI Operator](https://github.com/kubeflow/mpi-operator). Please refer to [this example](https://github.com/kubeflow/mpi-operator/tree/master/examples/mxnet) for details, including the Dockerfile with all the dependencies mentioned in previous sections, distributed training Python script based on Horovod, and the YAML configuration file that can be used for submitting a job on a Kubernetes cluster.
 
 # Usage
 
@@ -66,8 +71,8 @@ To run MXNet with Horovod, make the following additions to your training script:
 3. Scale the learning rate by number of workers. Effective batch size in synchronous distributed training is scaled by
     the number of workers. An increase in learning rate compensates for the increased batch size.
 
-4. Wrap optimizer in `hvd.DistributedOptimizer`.  The distributed optimizer delegates gradient computation
-    to the original optimizer, averages gradients using *allreduce* or *allgather*, and then applies those averaged
+4. Create `hvd.DistributedTrainer` with optimizer when using Gluon API.  The distributed trainer or optimizer delegates gradient computation
+    to the original optimizer, averages gradients using *allreduce*, and then applies those averaged
     gradients.
 
 5. Add `hvd.broadcast_parameters` to broadcast initial variable states from rank 0 to all other processes.
@@ -97,12 +102,13 @@ num_workers = hvd.size()
 model = ...
 model.hybridize()
 
-# Define hyper parameters
-optimizer_params = ...
 
-# Add Horovod Distributed Optimizer
+# Create optimizer
+optimizer_params = ...
 opt = mx.optimizer.create('sgd', **optimizer_params)
-opt = hvd.DistributedOptimizer(opt)
+
+# Create DistributedTrainer, a subclass of gluon.Trainer
+trainer = hvd.DistributedTrainer(params, opt)
 
 # Initialize parameters
 model.initialize(initializer, ctx=context)
@@ -112,8 +118,7 @@ params = model.collect_params()
 if params is not None:
     hvd.broadcast_parameters(params, root_rank=0)
 
-# Create trainer and loss function
-trainer = gluon.Trainer(params, opt, kvstore=None)
+# Create loss function
 loss_fn = ...
 
 # Train model
@@ -129,56 +134,12 @@ for epoch in range(num_epoch):
         trainer.step(batch_size)
 ```
 
-## Module API
-```python
-import mxnet as mx
-import horovod.mxnet as hvd
-
-# Initialize Horovod
-hvd.init()
-
-# Set context to current process
-context = mx.cpu(hvd.local_rank()) if args.no_cuda else mx.gpu(hvd.local_rank())
-num_workers = hvd.size()
-
-# Build model
-model = ...
-
-# Define hyper parameters
-optimizer_params = ...
-
-# Add Horovod Distributed Optimizer
-opt = mx.optimizer.create('sgd', **optimizer_params)
-opt = hvd.DistributedOptimizer(opt)
-
-# Initialize parameters
-initializer = mx.init.Xavier(rnd_type='gaussian', factor_type="in",
-                             magnitude=2)
-model.bind(data_shapes=train_data.provide_data,
-           label_shapes=train_data.provide_label)
-model.init_params(initializer)
-
-# Fetch and broadcast parameters
-(arg_params, aux_params) = model.get_params()
-if arg_params:
-    hvd.broadcast_parameters(arg_params, root_rank=0)
-if aux_params:
-    hvd.broadcast_parameters(aux_params, root_rank=0)
-model.set_params(arg_params=arg_params, aux_params=aux_params)
-
-# Train model
-model.fit(train_data,
-          kvstore=None,
-          optimizer=opt,
-          num_epoch=num_epoch)
-```
-
 
 # Running Horovod
 
 The example commands below show how to run distributed training. See the 
-[Running Horovod](https://github.com/horovod/horovod/blob/master/docs/running.md)
-page for more instructions, including RoCE/InfiniBand tweaks and tips for dealing with hangs.
+[Running Horovod](https://github.com/horovod/horovod/blob/master/docs/running.rst)
+page for more instructions.
 
 1. To run on a machine with 4 CPUs:
 
@@ -199,3 +160,11 @@ $ mpirun -np 8 \
     -mca pml ob1 -mca btl ^openib \
     python train.py
 ```
+
+## Tuning Horovod Performance
+
+1. To analyse horovod performance, [horovod timeline](https://github.com/horovod/horovod/blob/master/docs/timeline.rst) is a handy tool to trace and visualize the time spent on horovod operations. 
+
+2. A few tuning knobs affect horovod runtime performance (explained [here](https://github.com/horovod/horovod/blob/master/docs/tensor-fusion.rst)). Apart from `HOROVOD_FUSION_THRESHOLD`, sometimes we find increasing `HOROVOD_CYCLE_TIME` (up to 100 ms), changing [`NCCL_ALGO`](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/docs/env.html#nccl-algo), and [`NCCL_MIN_NCHANNELS`](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/docs/env.html#nccl-min-nchannels) improves performance.
+
+3. If you are running horovod on AWS, you can potentially leverage [EFA](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html) if your instance supports 100 Gb/s networking. To use EFA, you can refer to the [official documentation](https://docs.aws.amazon.com/eu_us/AWSEC2/latest/UserGuide/efa-start-nccl-dlami.html) for the setup instructions, and the environment variables (`-x FI_PROVIDER`, `-x FI_EFA_TX_MIN_CREDITS`) to set. Besides, you need to make sure EFA library is included in the shared library path (`-x LD_LIBRARY_PATH`).

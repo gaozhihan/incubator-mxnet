@@ -37,4 +37,3 @@ NNVM_REGISTER_OP(_backward_SoftmaxOutput)
 
 }  // namespace op
 }  // namespace mxnet
-

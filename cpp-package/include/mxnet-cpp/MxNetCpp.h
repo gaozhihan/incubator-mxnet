@@ -30,7 +30,6 @@
 #include "mxnet-cpp/executor.hpp"
 #include "mxnet-cpp/symbol.hpp"
 #include "mxnet-cpp/ndarray.hpp"
-#include "mxnet-cpp/monitor.hpp"
 #include "mxnet-cpp/operator.hpp"
 #include "mxnet-cpp/optimizer.hpp"
 #include "mxnet-cpp/kvstore.hpp"
@@ -39,5 +38,6 @@
 #include "mxnet-cpp/io.hpp"
 #include "mxnet-cpp/metric.h"
 #include "mxnet-cpp/initializer.h"
+#include "mxnet-cpp/contrib.h"
 
 #endif  // MXNET_CPP_MXNETCPP_H_

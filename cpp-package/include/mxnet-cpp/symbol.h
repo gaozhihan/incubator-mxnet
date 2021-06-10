@@ -138,7 +138,7 @@ class Symbol {
   /*!
   * \return the SymbolHandle
   */
-  SymbolHandle GetHandle() const { return (blob_ptr_) ? blob_ptr_->handle_: NULL; }
+  SymbolHandle GetHandle() const { return (blob_ptr_) ? blob_ptr_->handle_: nullptr; }
   /*!
   * \brief construct an operator Symbol, with given input Symbol and config
   * \param name the name of the Symbol
@@ -174,10 +174,29 @@ class Symbol {
   *unnamed (empty string).
   */
   std::vector<std::string> ListArguments() const;
+  /*! \return lists all argument names and aux states of the symbol */
+  std::vector<std::string> ListInputs() const;
   /*! \return get the descriptions of outputs for this symbol */
   std::vector<std::string> ListOutputs() const;
   /*! \return get the descriptions of auxiliary data for this symbol */
   std::vector<std::string> ListAuxiliaryStates() const;
+  /*! \return get all attributes for this symbol */
+  std::map<std::string, std::string> ListAttributes() const;
+  /*!
+   * \brief set key-value attribute to the symbol
+   * @param key string represent the key for the attribute
+   * @param value string represent the value for the attribute
+   */
+  void SetAttribute(const std::string& key, const std::string& value);
+  /*!
+   * \brief set a series of key-value attribute to the symbol
+   * @param attrs string:string map represent the key value attributes
+   */
+  void SetAttributes(const std::map<std::string, std::string>& attrs);
+  /*! \return get number of outputs for this symbol */
+  mx_uint GetNumOutputs() const;
+  /*! \return get the new symbol through subgraph API for this symbol */
+  mxnet::cpp::Symbol GetBackendSymbol(const std::string& backendName) const;
   /*! \return get the name of the symbol */
   std::string GetName() const;
   /*!

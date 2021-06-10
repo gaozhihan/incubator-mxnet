@@ -30,6 +30,12 @@
 namespace mxnet {
 namespace op {
 
+bool SupportMKLDNNSum(const NDArray& input) {
+  int ndim = input.shape().ndim();
+  return (input.dtype() == mshadow::kFloat32 || input.dtype() == mshadow::kBfloat16) &&
+         (ndim >= 1 && ndim <= 4) && input.storage_type() == kDefaultStorage;
+}
+
 static void ElemwiseAddEx(const nnvm::NodeAttrs& attrs,
                           const OpContext& ctx,
                           const std::vector<NDArray>& inputs,
@@ -37,9 +43,9 @@ static void ElemwiseAddEx(const nnvm::NodeAttrs& attrs,
                           const std::vector<NDArray>& outputs) {
   CHECK_EQ(inputs.size(), 2U);
   CHECK_EQ(outputs.size(), 1U);
-#if MXNET_USE_MKLDNN == 1
-  if (SupportMKLDNN(inputs[0]) && SupportMKLDNN(inputs[1])) {
-    MKLDNNSumForward(attrs, ctx, inputs, req[0], outputs[0]);
+#if MXNET_USE_ONEDNN == 1
+  if (SupportMKLDNNSum(inputs[0]) && SupportMKLDNNSum(inputs[1])) {
+    MKLDNNRun(MKLDNNSumForward, attrs, ctx, inputs, req, outputs);
     return;
   } else if (inputs[0].storage_type() == kDefaultStorage
              && inputs[1].storage_type() == kDefaultStorage) {
@@ -61,7 +67,7 @@ static inline bool ElemwiseAddStorageType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1);
   bool ret = ElemwiseBinaryOp::PreferDenseStorageType<true, true, true>(
                attrs, dev_mask, dispatch_mode, in_attrs, out_attrs);
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (dev_mask == mshadow::cpu::kDevMask && !MKLDNNEnvSet()) {
     *dispatch_mode = DispatchMode::kFComputeFallback;
   } else if (dev_mask == mshadow::cpu::kDevMask
@@ -76,15 +82,19 @@ static inline bool ElemwiseAddStorageType(const nnvm::NodeAttrs& attrs,
 MXNET_OPERATOR_REGISTER_BINARY(elemwise_add)
 .set_attr<FInferStorageType>("FInferStorageType", ElemwiseAddStorageType)
 .set_attr<FCompute>("FCompute<cpu>", ElemwiseBinaryOp::Compute<cpu, op::mshadow_op::plus>)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 #endif
 .set_attr<FComputeEx>("FComputeEx<cpu>", ElemwiseAddEx)
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<FResourceRequest>("FResourceRequest",  /* For Sparse CSR */
                             [](const NodeAttrs& attrs) {
                             return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};})
 MXNET_ADD_SPARSE_OP_ALIAS(elemwise_add)
 .add_alias("_add").add_alias("_plus").add_alias("_Plus")
+.set_attr<nnvm::FListOutputNames>("FListOutputNames", [](const NodeAttrs& attrs) {
+  return std::vector<std::string>{"output"};
+})
 .describe(R"code(Adds arguments element-wise.
 
 The storage type of ``elemwise_add`` output depends on storage types of inputs
@@ -111,10 +121,10 @@ static void _backward_ElemwiseAddEx(const nnvm::NodeAttrs& attrs,
                                     const std::vector<NDArray>& outputs) {
   CHECK_EQ(inputs.size(), 1U);
   CHECK_EQ(outputs.size(), 2U);
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (inputs[0].IsMKLDNNData()) {
-    MKLDNNCopy(attrs, ctx, inputs[0], req[0], outputs[0]);
-    MKLDNNCopy(attrs, ctx, inputs[0], req[1], outputs[1]);
+    MKLDNNRun(MKLDNNCopy, attrs, ctx, inputs[0], req[0], outputs[0]);
+    MKLDNNRun(MKLDNNCopy, attrs, ctx, inputs[0], req[1], outputs[1]);
     return;
   } else if (common::ContainsOnlyStorage(inputs, kDefaultStorage)) {
     FallBackCompute(
@@ -136,7 +146,7 @@ static inline bool ElemwiseAddBackwardStorageType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 2);
   bool ret = ElemwiseStorageType<1, 2, true, true, true>(attrs, dev_mask, dispatch_mode,
                                                          in_attrs, out_attrs);
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   if (dev_mask == mshadow::cpu::kDevMask && !MKLDNNEnvSet()) {
     *dispatch_mode = DispatchMode::kFComputeFallback;
   } else if (dev_mask == mshadow::cpu::kDevMask) {
@@ -155,7 +165,7 @@ NNVM_REGISTER_OP(_backward_add)
                                   return std::vector<std::pair<int, int> >{{0, 0},
                                                                            {0, 1}};
                                 })
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
   return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
 })
@@ -223,6 +233,7 @@ The storage type of ``elemwise_mul`` output depends on storage types of inputs
                               [](const NodeAttrs& attrs) {
                                 return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
                               })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .add_alias("_mul").add_alias("_Mul")
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseIn{"_backward_mul"});
 
@@ -263,8 +274,6 @@ NNVM_REGISTER_OP(_backward_div)
                                   return std::vector<std::pair<int, int> >{{0, 1}};
                                 })
 .set_attr<FCompute>("FCompute<cpu>", ElemwiseBinaryOp::BackwardUseIn<
-  cpu, mshadow_op::div_grad, mshadow_op::div_rgrad>)
-.set_attr<FComputeEx>("FComputeEx<cpu>", ElemwiseBinaryOp::BackwardUseInEx<
   cpu, mshadow_op::div_grad, mshadow_op::div_rgrad>);
 
 MXNET_OPERATOR_REGISTER_BINARY(_mod)

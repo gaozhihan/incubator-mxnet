@@ -27,13 +27,74 @@
 #include "./deconvolution-inl.h"
 #include "../operator_common.h"
 #include "../../common/utils.h"
-#if MXNET_USE_MKLDNN == 1
-#include "./mkldnn/mkldnn_ops-inl.h"
+#if MXNET_USE_ONEDNN == 1
 #include "./mkldnn/mkldnn_base-inl.h"
-#endif
+#include "./mkldnn/mkldnn_ops-inl.h"
+#endif  // MXNET_USE_ONEDNN
 
 namespace mxnet {
 namespace op {
+
+#if MXNET_USE_ONEDNN == 1
+static void DeconvolutionComputeExCPU(const nnvm::NodeAttrs& attrs,
+                                      const OpContext& ctx,
+                                      const std::vector<NDArray>& inputs,
+                                      const std::vector<OpReqType>& req,
+                                      const std::vector<NDArray>& outputs) {
+  const DeconvolutionParam& params = nnvm::get<DeconvolutionParam>(attrs.parsed);
+  if (SupportMKLDNNDeconv(params, inputs[0])) {
+    MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
+    MKLDNNRun(MKLDNNDeconvolutionForward, attrs, ctx, inputs, req, outputs);
+    MKLDNN_OPCHECK_RUN(DeconvolutionCompute<cpu>, attrs, ctx, inputs, req, outputs);
+    return;
+  }
+  FallBackCompute(DeconvolutionCompute<cpu>, attrs, ctx, inputs, req, outputs);
+}
+
+static void DeconvolutionGradComputeExCPU(const nnvm::NodeAttrs& attrs,
+                                          const OpContext& ctx,
+                                          const std::vector<NDArray>& inputs,
+                                          const std::vector<OpReqType>& req,
+                                          const std::vector<NDArray>& outputs) {
+  const DeconvolutionParam& params = nnvm::get<DeconvolutionParam>(attrs.parsed);
+  if (SupportMKLDNNDeconv(params, inputs[0])) {
+    MKLDNN_OPCHECK_INIT(true, outputs.size(), inputs, outputs);
+    MKLDNNRun(MKLDNNDeconvolutionBackward, attrs, ctx, inputs, req, outputs);
+    MKLDNN_OPCHECK_RUN(DeconvolutionGradCompute<cpu>, attrs, ctx, inputs, req, outputs);
+    return;
+  }
+  FallBackCompute(DeconvolutionGradCompute<cpu>, attrs, ctx, inputs, req, outputs);
+}
+
+inline static bool DeconvStorageType(const nnvm::NodeAttrs& attrs,
+                                     const int dev_mask,
+                                     DispatchMode* dispatch_mode,
+                                     std::vector<int>* in_attrs,
+                                     std::vector<int>* out_attrs) {
+  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
+  uint32_t in_expected = param.no_bias ? 2 : 3;
+  CHECK_EQ(in_attrs->size(), in_expected);
+  CHECK_EQ(out_attrs->size(), 1);
+
+  return MKLDNNStorageType(attrs, dev_mask, true, dispatch_mode, in_attrs,
+                           out_attrs);
+}
+
+inline static bool BackwardDeconvStorageType(const nnvm::NodeAttrs& attrs,
+                                             const int dev_mask,
+                                             DispatchMode* dispatch_mode,
+                                             std::vector<int> *in_attrs,
+                                             std::vector<int> *out_attrs) {
+  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
+  uint32_t in_expected = param.no_bias ? 3 : 4;
+  uint32_t out_expected = param.no_bias ? 2 : 3;
+  CHECK_EQ(in_attrs->size(), in_expected);
+  CHECK_EQ(out_attrs->size(), out_expected);
+
+  return MKLDNNStorageType(attrs, dev_mask, true, dispatch_mode, in_attrs,
+                           out_attrs);
+}
+#endif
 
 static bool DeconvolutionShape(const nnvm::NodeAttrs& attrs,
                                mxnet::ShapeVector *in_shape,
@@ -54,7 +115,7 @@ static bool DeconvolutionShape(const nnvm::NodeAttrs& attrs,
   }
   out_shape->resize(1, mxnet::TShape());
   const mxnet::TShape &dshape = (*in_shape)[deconv::kData];
-  if (dshape.ndim() ==  0) return false;
+  if (!mxnet::ndim_is_known(dshape)) return false;
 
   if (param_.kernel.ndim() == 1) {
     // 1d conv
@@ -90,8 +151,12 @@ static bool DeconvolutionShape(const nnvm::NodeAttrs& attrs,
     Shape<3> oshape;
     oshape[0] = dshape_ncw[0];
     oshape[1] = param_.num_filter;
-    oshape[2] = param_.stride[0] * (dshape_ncw[2] - 1) +
-      dilated_ksize_x - 2 * o_pad[0] + o_adj[0];
+    if (mxnet::dim_size_is_known(dshape_ncw[2])) {
+      oshape[2] = param_.stride[0] * (dshape_ncw[2] - 1) +
+          dilated_ksize_x - 2 * o_pad[0] + o_adj[0];
+    } else {
+      oshape[2] = -1;
+    }
 
     if (param_.target_shape.ndim() > 0) {
       if (param_.target_shape[0] > 0) {
@@ -141,10 +206,18 @@ static bool DeconvolutionShape(const nnvm::NodeAttrs& attrs,
     Shape<4> oshape;
     oshape[0] = dshape_nchw[0];
     oshape[1] = param_.num_filter;
-    oshape[2] = param_.stride[0] * (dshape_nchw[2] - 1) +
-      dilated_ksize_y - 2 * o_pad[0] + o_adj[0];
-    oshape[3] = param_.stride[1] * (dshape_nchw[3] - 1) +
-      dilated_ksize_x - 2 * o_pad[1] + o_adj[1];
+    if (mxnet::dim_size_is_known(dshape_nchw[2])) {
+      oshape[2] = param_.stride[0] * (dshape_nchw[2] - 1) +
+          dilated_ksize_y - 2 * o_pad[0] + o_adj[0];
+    } else {
+      oshape[2] = -1;
+    }
+    if (mxnet::dim_size_is_known(dshape_nchw[3])) {
+      oshape[3] = param_.stride[1] * (dshape_nchw[3] - 1) +
+          dilated_ksize_x - 2 * o_pad[1] + o_adj[1];
+    } else {
+      oshape[3] = -1;
+    }
 
     if (param_.target_shape.ndim() > 1) {
       if (param_.target_shape[0] > 0) {
@@ -203,12 +276,24 @@ static bool DeconvolutionShape(const nnvm::NodeAttrs& attrs,
     Shape<5> oshape;
     oshape[0] = dshape_ncdhw[0];
     oshape[1] = param_.num_filter;
-    oshape[2] = param_.stride[0] * (dshape_ncdhw[2] - 1) +
-      dilated_ksize_d - 2 * o_pad[0] + o_adj[0];
-    oshape[3] = param_.stride[1] * (dshape_ncdhw[3] - 1) +
-      dilated_ksize_y - 2 * o_pad[1] + o_adj[1];
-    oshape[4] = param_.stride[2] * (dshape_ncdhw[4] - 1) +
-      dilated_ksize_x - 2 * o_pad[2] + o_adj[2];
+    if (mxnet::dim_size_is_known(dshape_ncdhw[2])) {
+      oshape[2] = param_.stride[0] * (dshape_ncdhw[2] - 1) +
+          dilated_ksize_d - 2 * o_pad[0] + o_adj[0];
+    } else {
+      oshape[2] = -1;
+    }
+    if (mxnet::dim_size_is_known(dshape_ncdhw[3])) {
+      oshape[3] = param_.stride[1] * (dshape_ncdhw[3] - 1) +
+          dilated_ksize_y - 2 * o_pad[1] + o_adj[1];
+    } else {
+      oshape[3] = -1;
+    }
+    if (mxnet::dim_size_is_known(dshape_ncdhw[4])) {
+      oshape[4] = param_.stride[2] * (dshape_ncdhw[4] - 1) +
+          dilated_ksize_x - 2 * o_pad[2] + o_adj[2];
+    } else {
+      oshape[4] = -1;
+    }
 
     if (param_.target_shape.ndim() > 2) {
       if (param_.target_shape[0] > 0) {
@@ -247,7 +332,21 @@ static bool DeconvolutionType(const nnvm::NodeAttrs& attrs,
   const DeconvolutionParam& param_ = nnvm::get<DeconvolutionParam>(attrs.parsed);
   CHECK_GE(in_type->size(), 1U);
   int dtype = (*in_type)[0];
-  CHECK_NE(dtype, -1) << "First input must have specified type";
+  if (type_is_none(dtype)) {
+    // Input type is undefined, we try backward inference
+    if (out_type->size() == 0 || type_is_none((*out_type)[0])) {
+       // Neither the input nor the output are defined,
+       // types cannot be infered for this op
+      return false;
+    } else {
+       // Input type is undefined but output type is: backward inference
+      dtype = (*out_type)[0];
+    }
+  } else {
+    // Input type is defined but output type is not: forward inference
+    out_type->clear();
+    out_type->push_back(dtype);
+  }
   for (size_t i = 0; i < in_type->size(); ++i) {
     if ((*in_type)[i] == -1) {
       (*in_type)[i] = dtype;
@@ -255,74 +354,8 @@ static bool DeconvolutionType(const nnvm::NodeAttrs& attrs,
       UNIFORM_TYPE_CHECK((*in_type)[i], dtype, ListArguments(param_)[i]);
     }
   }
-  out_type->clear();
-  out_type->push_back(dtype);
   return true;
 }
-
-#if MXNET_USE_MKLDNN == 1
-inline static bool DeconvStorageType(const nnvm::NodeAttrs& attrs,
-                                     const int dev_mask,
-                                     DispatchMode* dispatch_mode,
-                                     std::vector<int> *in_attrs,
-                                     std::vector<int> *out_attrs) {
-  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
-  uint32_t in_expected = param.no_bias ? 2 : 3;
-  CHECK_EQ(in_attrs->size(), in_expected);
-  CHECK_EQ(out_attrs->size(), 1);
-
-  return MKLDNNStorageType(attrs, dev_mask, true, dispatch_mode, in_attrs,
-                           out_attrs);
-}
-
-inline static bool BackwardDeconvStorageType(const nnvm::NodeAttrs& attrs,
-                                             const int dev_mask,
-                                             DispatchMode* dispatch_mode,
-                                             std::vector<int> *in_attrs,
-                                             std::vector<int> *out_attrs) {
-  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
-  uint32_t out_expected = param.no_bias ? 2 : 3;
-  CHECK_EQ(in_attrs->size(), param.no_bias ? 3U : 4U);
-  CHECK_EQ(out_attrs->size(), out_expected);
-
-  return MKLDNNStorageType(attrs, dev_mask, true, dispatch_mode, in_attrs,
-                           out_attrs);
-}
-
-static void DeconvolutionComputeExCPU(const nnvm::NodeAttrs& attrs,
-                                      const OpContext& ctx,
-                                      const std::vector<NDArray>& inputs,
-                                      const std::vector<OpReqType>& req,
-                                      const std::vector<NDArray>& outputs) {
-  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
-  if (SupportMKLDNNDeconv(param, inputs[0])) {
-    MKLDNN_OPCHECK_INIT(false, outputs.size(), inputs, outputs);
-    MKLDNNDeconvolutionForward(attrs, ctx, inputs, req, outputs);
-    MKLDNN_OPCHECK_RUN(DeconvolutionCompute<cpu>, attrs, ctx, inputs, req,
-                       outputs);
-    return;
-  }
-  FallBackCompute(DeconvolutionCompute<cpu>, attrs, ctx, inputs, req,
-                  outputs);
-}
-
-static void DeconvolutionGradComputeExCPU(const nnvm::NodeAttrs& attrs,
-                                          const OpContext& ctx,
-                                          const std::vector<NDArray>& inputs,
-                                          const std::vector<OpReqType>& req,
-                                          const std::vector<NDArray>& outputs) {
-  const DeconvolutionParam& param = nnvm::get<DeconvolutionParam>(attrs.parsed);
-  if (SupportMKLDNNDeconv(param, inputs[0])) {
-    MKLDNN_OPCHECK_INIT(true, outputs.size(), inputs, outputs);
-    MKLDNNDeconvolutionBackward(attrs, ctx, inputs, req, outputs);
-    MKLDNN_OPCHECK_RUN(DeconvolutionGradCompute<cpu>, attrs, ctx, inputs, req,
-                       outputs);
-    return;
-  }
-  FallBackCompute(DeconvolutionGradCompute<cpu>, attrs, ctx, inputs, req,
-                  outputs);
-}
-#endif
 
 static void DeconvolutionParamParser(nnvm::NodeAttrs* attrs) {
   using namespace mshadow;
@@ -369,7 +402,7 @@ static void DeconvolutionParamParser(nnvm::NodeAttrs* attrs) {
 
 struct DeconvolutionGrad {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                                           const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
     heads.push_back(n->inputs[deconv::kData]);
@@ -384,6 +417,7 @@ struct DeconvolutionGrad {
 DMLC_REGISTER_PARAMETER(DeconvolutionParam);
 
 NNVM_REGISTER_OP(Deconvolution)
+.add_alias("_npx_deconvolution")
 .describe("Computes 1D or 2D transposed convolution (aka fractionally strided convolution) of the "
     "input tensor. This operation can be seen as the gradient of Convolution operation with "
     "respect to its input. Convolution usually reduces the size of the input. Transposed "
@@ -405,18 +439,17 @@ NNVM_REGISTER_OP(Deconvolution)
 })
 .set_attr<mxnet::FInferShape>("FInferShape", DeconvolutionShape)
 .set_attr<nnvm::FInferType>("FInferType", DeconvolutionType)
-#if MXNET_USE_MKLDNN == 1
-.set_attr<FInferStorageType>("FInferStorageType", DeconvStorageType)
-#endif
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
   return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
 })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<FCompute>("FCompute<cpu>", DeconvolutionCompute<cpu>)
-#if MXNET_USE_MKLDNN == 1
+.set_attr<nnvm::FGradient>("FGradient", DeconvolutionGrad{"_backward_Deconvolution"})
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
+.set_attr<FInferStorageType>("FInferStorageType", DeconvStorageType)
 .set_attr<FComputeEx>("FComputeEx<cpu>", DeconvolutionComputeExCPU)
 #endif
-.set_attr<nnvm::FGradient>("FGradient", DeconvolutionGrad{"_backward_Deconvolution"})
 .add_argument("data", "NDArray-or-Symbol", "Input tensor to the deconvolution operation.")
 .add_argument("weight", "NDArray-or-Symbol", "Weights representing the kernel.")
 .add_argument("bias", "NDArray-or-Symbol", "Bias added to the result after the deconvolution "
@@ -424,20 +457,22 @@ NNVM_REGISTER_OP(Deconvolution)
 .add_arguments(DeconvolutionParam::__FIELDS__());
 
 NNVM_REGISTER_OP(_backward_Deconvolution)
+.set_num_inputs([](const NodeAttrs& attrs) {
+  const DeconvolutionParam& params = nnvm::get<DeconvolutionParam>(attrs.parsed);
+  return params.no_bias ? 3 : 4;
+})
 .set_num_outputs([](const NodeAttrs& attrs) {
   const DeconvolutionParam& params = nnvm::get<DeconvolutionParam>(attrs.parsed);
   return params.no_bias ? 2 : 3;
 })
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
-#if MXNET_USE_MKLDNN == 1
-.set_attr<FInferStorageType>("FInferStorageType", BackwardDeconvStorageType)
-#endif
 .set_attr<FResourceRequest>("FResourceRequest", [](const NodeAttrs& n) {
   return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
 })
 .set_attr_parser(DeconvolutionParamParser)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
+.set_attr<FInferStorageType>("FInferStorageType", BackwardDeconvStorageType)
 .set_attr<FComputeEx>("FComputeEx<cpu>", DeconvolutionGradComputeExCPU)
 #endif
 .set_attr<FCompute>("FCompute<cpu>", DeconvolutionGradCompute<cpu>);

@@ -25,7 +25,7 @@
 #ifndef MXNET_OPERATOR_NN_MKLDNN_MKLDNN_CONVOLUTION_INL_H_
 #define MXNET_OPERATOR_NN_MKLDNN_MKLDNN_CONVOLUTION_INL_H_
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 
 #include <vector>
 #include <utility>
@@ -38,10 +38,11 @@ namespace op {
 
 struct MKLDNNConvParam : public dmlc::Parameter<MKLDNNConvParam> {
   bool with_bn;
-  bool with_relu;
+  bool with_act;
   bool with_sum;
-  bool with_postsum_relu;
+  bool with_postsum_act;
   bool quantized;
+  bool dedup_sum;
 
   dmlc::optional<float> min_calib_range;  // min float value calculated from calibration dataset
   dmlc::optional<float> max_calib_range;  // max float value calculated from calibration dataset
@@ -49,14 +50,16 @@ struct MKLDNNConvParam : public dmlc::Parameter<MKLDNNConvParam> {
   DMLC_DECLARE_PARAMETER(MKLDNNConvParam) {
     DMLC_DECLARE_FIELD(with_bn).set_default(false)
     .describe("Add post batchnorm.");
-    DMLC_DECLARE_FIELD(with_relu).set_default(false)
-    .describe("Add post relu");
+    DMLC_DECLARE_FIELD(with_act).set_default(false)
+    .describe("Add post activation");
     DMLC_DECLARE_FIELD(with_sum).set_default(false)
     .describe("Add post sum");
-    DMLC_DECLARE_FIELD(with_postsum_relu).set_default(false)
-    .describe("Add post relu after sum");
+    DMLC_DECLARE_FIELD(with_postsum_act).set_default(false)
+    .describe("Add post activation after sum");
     DMLC_DECLARE_FIELD(quantized).set_default(false)
     .describe("enable quantization");
+    DMLC_DECLARE_FIELD(dedup_sum).set_default(false).
+    describe("deduplicated sum input");
     DMLC_DECLARE_FIELD(min_calib_range)
     .set_default(dmlc::optional<float>())
     .describe("The minimum scalar value in the form of float32 obtained "
@@ -73,54 +76,34 @@ struct MKLDNNConvParam : public dmlc::Parameter<MKLDNNConvParam> {
 struct MKLDNNConvFullParam {
   ConvolutionParam conv_param;
   MKLDNNConvParam mkldnn_param;
-  float sum_scale;
+  float sum_scale = 1.f;
   std::vector<float> requantize_scales;
+  MKLDNNPostEltwiseParam act_param;
+  MKLDNNPostEltwiseParam postsum_act_param;
 };
 
-static inline bool IsOutputUInt8(const MKLDNNConvParam &mkldnn_param) {
-  return ((!mkldnn_param.with_sum) && mkldnn_param.with_relu) ||
-         mkldnn_param.with_postsum_relu;
-}
-
-mkldnn::convolution_forward::primitive_desc GetConvFwdImpl(const MKLDNNConvFullParam &param,
-                                                           const bool is_train,
-                                                           const NDArray &data,
-                                                           const NDArray &weights,
-                                                           const NDArray *bias,
-                                                           const NDArray &output);
+std::shared_ptr<mkldnn::convolution_forward::primitive_desc> GetConvFwdImpl(
+    const ConvolutionParam &param, const bool is_train, const NDArray &data, const NDArray &weight,
+    const NDArray *bias, const NDArray &output);
 
 class MKLDNNConvForward {
  public:
-  mkldnn::convolution_forward::primitive_desc fwd_pd;
-
   MKLDNNConvForward(const MKLDNNConvFullParam &param, const bool is_train, const NDArray &data,
-                    const NDArray &weights, const NDArray *bias, const NDArray &output);
+                    const NDArray &weight, const NDArray *bias, const NDArray &output);
 
-  void SetNewMem(const mkldnn::memory &data, const mkldnn::memory &weight,
-                 const mkldnn::memory *bias, const mkldnn::memory &output);
+  const mkldnn::convolution_forward &GetFwd() const { return *fwd_; }
 
-  void SetNewMem(const mkldnn::memory &data, const mkldnn::memory &output) {
-    this->data_->set_data_handle(data.get_data_handle());
-    this->out_->set_data_handle(output.get_data_handle());
-  }
-
-  const mkldnn::convolution_forward &GetFwd() const {
-    return *fwd_;
-  }
+  const mkldnn::convolution_forward::primitive_desc &GetPd() const { return *pd_; }
 
  private:
   std::shared_ptr<mkldnn::convolution_forward> fwd_;
-  std::shared_ptr<mkldnn::memory> data_;
-  std::shared_ptr<mkldnn::memory> weight_;
-  std::shared_ptr<mkldnn::memory> bias_;
-  std::shared_ptr<mkldnn::memory> out_;
+  std::shared_ptr<mkldnn::convolution_forward::primitive_desc> pd_;
 };
 
 typedef ParamOpSign<ConvolutionParam> MKLDNNConvSignature;
 
-MKLDNNConvForward &GetConvFwd(const ConvolutionParam &param,
-                              const bool is_train, const NDArray &data,
-                              const NDArray &weights, const NDArray *bias,
+MKLDNNConvForward &GetConvFwd(const MKLDNNConvFullParam &param, const bool is_train,
+                              const NDArray &data, const NDArray &weight, const NDArray *bias,
                               const NDArray &output);
 
 void MKLDNNConvolutionForwardFullFeature(const MKLDNNConvFullParam &param,
@@ -130,8 +113,38 @@ void MKLDNNConvolutionForwardFullFeature(const MKLDNNConvFullParam &param,
                                          const std::vector<OpReqType> &req,
                                          const std::vector<NDArray> &out_data);
 
+void MKLDNNConvolutionForward(const nnvm::NodeAttrs &attrs,
+                              const OpContext &ctx,
+                              const std::vector<NDArray> &in_data,
+                              const std::vector<OpReqType> &req,
+                              const std::vector<NDArray> &out_data);
+
+class MKLDNNConvBackward {
+ public:
+  MKLDNNConvBackward(const MKLDNNConvFullParam &param, const NDArray &data, const NDArray &weight,
+                     const NDArray *bias, const NDArray &output);
+
+  const mkldnn::convolution_backward_data &GetBwdData() const { return *bwd_data_; }
+
+  const mkldnn::convolution_backward_weights &GetBwdWeights() const { return *bwd_weight_; }
+
+  const mkldnn::convolution_backward_data::primitive_desc &GetDataPd() const {
+    return *bwd_data_pd_;
+  }
+
+  const mkldnn::convolution_backward_weights::primitive_desc &GetWeightsPd() const {
+    return *bwd_weight_pd_;
+  }
+
+ private:
+  std::shared_ptr<mkldnn::convolution_backward_data::primitive_desc> bwd_data_pd_;
+  std::shared_ptr<mkldnn::convolution_backward_weights::primitive_desc> bwd_weight_pd_;
+  std::shared_ptr<mkldnn::convolution_backward_data> bwd_data_;
+  std::shared_ptr<mkldnn::convolution_backward_weights> bwd_weight_;
+};
+
 }  // namespace op
 }  // namespace mxnet
 
-#endif  // MXNET_USE_MKLDNN == 1
+#endif  // MXNET_USE_ONEDNN == 1
 #endif  // MXNET_OPERATOR_NN_MKLDNN_MKLDNN_CONVOLUTION_INL_H_

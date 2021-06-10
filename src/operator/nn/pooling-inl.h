@@ -55,7 +55,7 @@ struct PoolingParam : public dmlc::Parameter<PoolingParam> {
   dmlc::optional<bool> count_include_pad;
   dmlc::optional<int> layout;
   DMLC_DECLARE_PARAMETER(PoolingParam) {
-    DMLC_DECLARE_FIELD(kernel).set_default(mxnet::TShape())  // add default value here
+    DMLC_DECLARE_FIELD(kernel).set_default(mxnet::TShape(0, 0))  // add default value here
     .enforce_nonzero()
     .describe("Pooling kernel size: (y, x) or (d, y, x)");
 
@@ -78,11 +78,11 @@ struct PoolingParam : public dmlc::Parameter<PoolingParam> {
     .add_enum("same", pool_enum::kSame)
     .describe("Pooling convention to be applied.");
 
-    DMLC_DECLARE_FIELD(stride).set_default(mxnet::TShape())
+    DMLC_DECLARE_FIELD(stride).set_default(mxnet::TShape(0, 0))
     .enforce_nonzero()
     .describe("Stride: for pooling (y, x) or (d, y, x). Defaults to 1 for each dimension.");
 
-    DMLC_DECLARE_FIELD(pad).set_default(mxnet::TShape())
+    DMLC_DECLARE_FIELD(pad).set_default(mxnet::TShape(0, 0))
     .describe("Pad for pooling: (y, x) or (d, y, x). Defaults to no padding.");
 
     DMLC_DECLARE_FIELD(p_value).set_default(dmlc::optional<int>())
@@ -137,6 +137,86 @@ struct PoolingParam : public dmlc::Parameter<PoolingParam> {
       }
     }
     return ret_val;
+  }
+
+  std::string PoolType2String(int pool_type) {
+    switch (pool_type) {
+      case pool_enum::kMaxPooling:
+        return "max";
+      case pool_enum::kAvgPooling:
+        return "avg";
+      case pool_enum::kSumPooling:
+        return "sum";
+      case pool_enum::kLpPooling:
+        return "lp";
+      default:
+        LOG(FATAL) << "Unknown pool type enum " << pool_type;
+    }
+    LOG(FATAL) << "should not reach here ";
+    return "";
+  }
+  std::string Convention2String(int pool_convention) {
+    switch (pool_convention) {
+      case pool_enum::kFull:
+        return "full";
+      case pool_enum::kValid:
+        return "valid";
+      case pool_enum::kSame:
+        return "same";
+      default:
+        LOG(FATAL) << "Unknown pool convention enum " << pool_convention;
+    }
+    LOG(FATAL) << "should not reach here ";
+    return "";
+  }
+  std::string Layout2String(int layout) {
+    switch (layout) {
+      case mshadow::kNCW:
+        return "NCW";
+      case mshadow::kNCHW:
+        return "NCHW";
+      case mshadow::kNCDHW:
+        return "NCDHW";
+      case mshadow::kNWC:
+        return "NWC";
+      case mshadow::kNHWC:
+        return "NHWC";
+      case mshadow::kNDHWC:
+        return "NDHWC";
+      default:
+        LOG(FATAL) << "Unknown layout enum " << layout;
+    }
+    LOG(FATAL) << "should not reach here ";
+    return "";
+  }
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream kernel_s, stride_s, pad_s, pool_type_s,
+                       pooling_convention_s, global_pool_s, cudnn_off_s,
+                       p_value_s, count_include_pad_s, layout_s;
+    kernel_s << kernel;
+    stride_s << stride;
+    pad_s << pad;
+    pool_type_s << pool_type;
+    pooling_convention_s << pooling_convention;
+    global_pool_s << global_pool;
+    cudnn_off_s << cudnn_off;
+    p_value_s << p_value;
+    count_include_pad_s << count_include_pad;
+    layout_s << layout;
+    (*dict)["kernel"] = kernel_s.str();
+    (*dict)["stride"] = stride_s.str();
+    (*dict)["pad"] = pad_s.str();
+    (*dict)["pool_type"] = PoolType2String(pool_type);
+    (*dict)["pooling_convention"] = Convention2String(pooling_convention);
+    (*dict)["global_pool"] = global_pool_s.str();
+    (*dict)["cudnn_off"] = cudnn_off_s.str();
+    (*dict)["p_value"] = p_value_s.str();
+    (*dict)["count_include_pad"] = count_include_pad_s.str();
+    if (layout.has_value()) {
+      (*dict)["layout"] = Layout2String(layout.value());
+    } else {
+      (*dict)["layout"] = layout_s.str();
+    }
   }
 };
 
@@ -200,11 +280,11 @@ class PoolingOp {
         kernel = mxnet::TShape(ishape.data() + 2,
                         ishape.data() + ishape.ndim());
       }
-      padding = mxnet::TShape(ishape.ndim() - 2);
+      padding = mxnet::TShape(ishape.ndim() - 2, 0);
       for (index_t i = 0; i < ishape.ndim() - 2; i++) {
         padding[i] = 0;
       }
-      stride = mxnet::TShape(ishape.ndim() - 2);
+      stride = mxnet::TShape(ishape.ndim() - 2, 1);
     }
     const int p_value = (param_.pool_type == pool_enum::kLpPooling && param_.p_value.has_value()) ?
                         param_.p_value.value() : 1;
@@ -257,11 +337,11 @@ class PoolingOp {
         kernel = mxnet::TShape(ishape.data() + 2,
                         ishape.data() + ishape.ndim());
       }
-      padding = mxnet::TShape(ishape.ndim() - 2);
+      padding = mxnet::TShape(ishape.ndim() - 2, 0);
       for (index_t i = 0; i < ishape.ndim() - 2; i++) {
         padding[i] = 0;
       }
-      stride = mxnet::TShape(ishape.ndim() - 2);
+      stride = mxnet::TShape(ishape.ndim() - 2, 1);
     }
 
     const int p_value = (param_.pool_type == pool_enum::kLpPooling && param_.p_value.has_value()) ?

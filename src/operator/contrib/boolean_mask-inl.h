@@ -50,6 +50,27 @@ struct BooleanMaskParam : public dmlc::Parameter<BooleanMaskParam> {
   }
 };
 
+struct BooleanMaskForwardCPUKernel {
+  template<typename DType>
+  static void Map(int i,
+                  DType* out,
+                  const DType* data,
+                  const int32_t* idx,
+                  const size_t col_size) {
+    // i is row id already
+    int32_t prev = (i == 0) ? 0 : idx[i - 1];
+    int32_t curr = idx[i];
+#pragma GCC diagnostic push
+#if __GNUC__ >= 8
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
+    if (prev != curr) {
+      std::memcpy(out + prev * col_size, data + i * col_size, col_size * sizeof(DType));
+    }
+#pragma GCC diagnostic pop
+  }
+};
+
 struct BooleanMaskForwardKernel {
   template<typename DType>
   static void MSHADOW_XINLINE Map(int i,
@@ -71,6 +92,7 @@ struct BooleanMaskBackwardKernel {
   template<typename DType>
   static void MSHADOW_XINLINE Map(int i,
                                   DType* igrad,
+                                  const OpReqType req,
                                   const DType* ograd,
                                   const int32_t* idx,
                                   const size_t col_size) {
@@ -79,7 +101,13 @@ struct BooleanMaskBackwardKernel {
     int32_t prev = (row_id == 0) ? 0 : idx[row_id - 1];
     int32_t curr = idx[row_id];
     if (prev != curr) {
-      igrad[i] = ograd[prev * col_size + col_id];
+      if (req == kAddTo)
+        igrad[i] += ograd[prev * col_size + col_id];
+      else
+        igrad[i] = ograd[prev * col_size + col_id];
+    } else {
+      if (req == kWriteTo || req == kWriteInplace)
+        igrad[i] = 0;
     }
   }
 };

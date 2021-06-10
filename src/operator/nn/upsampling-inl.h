@@ -56,10 +56,12 @@ struct UpSamplingParam : public dmlc::Parameter<UpSamplingParam> {
   uint64_t workspace;
   DMLC_DECLARE_PARAMETER(UpSamplingParam) {
     DMLC_DECLARE_FIELD(scale)
-    .set_range(1, 1000)
+    .set_lower_bound(1)
     .describe("Up sampling scale");
     DMLC_DECLARE_FIELD(num_filter)
-    .describe("Input filter. Only used by bilinear sample_type.")
+    .describe("Input filter. Only used by bilinear sample_type."
+              "Since bilinear upsampling uses deconvolution, num_filters "
+              "is set to the number of channels.")
     .set_default(0);
     DMLC_DECLARE_FIELD(sample_type)
     .add_enum("nearest", up_enum::kNearest)
@@ -77,7 +79,7 @@ struct UpSamplingParam : public dmlc::Parameter<UpSamplingParam> {
     "upsampling, this can be 1-N; the size of output will be"
     "(scale*h_0,scale*w_0) and all other inputs will be upsampled to the"
     "same size. For bilinear upsampling this must be 2; 1 input and 1 weight.");
-    DMLC_DECLARE_FIELD(workspace).set_default(512).set_range(0, 8192)
+    DMLC_DECLARE_FIELD(workspace).set_default(512).set_lower_bound(0)
     .describe("Tmp workspace for deconvolution (MB)");
   }
 };  // struct UpSamplingParam

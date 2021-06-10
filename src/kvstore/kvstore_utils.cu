@@ -50,7 +50,7 @@ size_t UniqueImplGPU(NDArray *workspace, mshadow::Stream<gpu> *s,
   size_t *null_ptr = nullptr;
   size_t *null_dptr = nullptr;
   cudaStream_t stream = mshadow::Stream<gpu>::GetStream(s);
-  cub::DeviceSelect::Unique(NULL, unique_temp_bytes, null_dptr, null_dptr,
+  cub::DeviceSelect::Unique(nullptr, unique_temp_bytes, null_dptr, null_dptr,
                             null_ptr, size, stream);
   // estimate sort temp space
   const size_t sort_output_bytes = size * sizeof(IType);
@@ -60,7 +60,7 @@ size_t UniqueImplGPU(NDArray *workspace, mshadow::Stream<gpu> *s,
   const int begin_bit = 0;
   // The most-significant bit index (exclusive) needed for key comparison
   const int end_bit = sizeof(IType) * 8;
-  cub::DeviceRadixSort::SortKeys(NULL, sort_temp_bytes, null_dptr, null_dptr,
+  cub::DeviceRadixSort::SortKeys(nullptr, sort_temp_bytes, null_dptr, null_dptr,
                                  size, begin_bit, end_bit, stream);
 #else
   // sort_temp_bytes remains 0 because thrust request memory by itself
@@ -82,16 +82,17 @@ size_t UniqueImplGPU(NDArray *workspace, mshadow::Stream<gpu> *s,
 #else
   thrust::sort(thrust::cuda::par.on(stream),
                dptr, dptr + size, thrust::greater<IType>());
-  CUDA_CALL(cudaMemcpy(sort_output_ptr, dptr, sort_output_bytes,
-                       cudaMemcpyDeviceToDevice));
+  CUDA_CALL(cudaMemcpyAsync(sort_output_ptr, dptr, sort_output_bytes,
+                            cudaMemcpyDeviceToDevice, stream));
 #endif
   // execute unique kernel
   cub::DeviceSelect::Unique(temp_storage, unique_temp_bytes, sort_output_ptr, dptr,
                             num_selected_ptr, size, stream);
   // retrieve num selected unique values
   size_t num_selected_out = 0;
-  CUDA_CALL(cudaMemcpy(&num_selected_out, num_selected_ptr, num_selected_bytes,
-     cudaMemcpyDeviceToHost));
+  CUDA_CALL(cudaMemcpyAsync(&num_selected_out, num_selected_ptr, num_selected_bytes,
+                            cudaMemcpyDeviceToHost, stream));
+  CUDA_CALL(cudaStreamSynchronize(stream));
   return num_selected_out;
 }
 

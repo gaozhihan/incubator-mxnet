@@ -163,8 +163,8 @@ struct DefaultImageAugmentParam : public dmlc::Parameter<DefaultImageAugmentPara
     DMLC_DECLARE_FIELD(saturation).set_default(0.0f)
         .describe("Add a random value in ``[-saturation, saturation]`` to "
                   "the saturation of image.");
-        DMLC_DECLARE_FIELD(pca_noise).set_default(0.0f)
-                .describe("Add PCA based noise to the image.");
+    DMLC_DECLARE_FIELD(pca_noise).set_default(0.0f)
+        .describe("Add PCA based noise to the image.");
     DMLC_DECLARE_FIELD(random_h).set_default(0)
         .describe("Add a random value in ``[-random_h, random_h]`` to "
                   "the H channel in HSL color space.");
@@ -205,7 +205,7 @@ std::vector<dmlc::ParamFieldInfo> ListDefaultAugParams() {
 class DefaultImageAugmenter : public ImageAugmenter {
  public:
   // contructor
-  DefaultImageAugmenter() {}
+  DefaultImageAugmenter() = default;
   void Init(const std::vector<std::pair<std::string, std::string> >& kwargs) override {
     std::vector<std::pair<std::string, std::string> > kwargs_left;
     kwargs_left = param_.InitAllowUnknown(kwargs);
@@ -236,7 +236,7 @@ class DefaultImageAugmenter : public ImageAugmenter {
       } else {
         return 1;  // CV_INTER_LINEAR for others
       }
-      } else if (inter_method == 10) {
+    } else if (inter_method == 10) {
       std::uniform_int_distribution<size_t> rand_uniform_int(0, 4);
       return rand_uniform_int(*prnd);
     } else {
@@ -268,9 +268,9 @@ class DefaultImageAugmenter : public ImageAugmenter {
         new_height = param_.resize;
         new_width = param_.resize*src.cols/src.rows;
       }
-      CHECK((param_.inter_method >= 1 && param_.inter_method <= 4) ||
+      CHECK((param_.inter_method >= 0 && param_.inter_method <= 4) ||
        (param_.inter_method >= 9 && param_.inter_method <= 10))
-        << "invalid inter_method: valid value 0,1,2,3,9,10";
+        << "invalid inter_method: valid value 0,1,2,3,4,9,10";
       int interpolation_method = GetInterMethod(param_.inter_method,
                    src.cols, src.rows, new_width, new_height, prnd);
       cv::resize(src, res, cv::Size(new_width, new_height),
@@ -325,9 +325,9 @@ class DefaultImageAugmenter : public ImageAugmenter {
       float ori_center_height = M.at<float>(1, 0) * res.cols + M.at<float>(1, 1) * res.rows;
       M.at<float>(0, 2) = (new_width - ori_center_width) / 2;
       M.at<float>(1, 2) = (new_height - ori_center_height) / 2;
-      CHECK((param_.inter_method >= 1 && param_.inter_method <= 4) ||
+      CHECK((param_.inter_method >= 0 && param_.inter_method <= 4) ||
         (param_.inter_method >= 9 && param_.inter_method <= 10))
-         << "invalid inter_method: valid value 0,1,2,3,9,10";
+         << "invalid inter_method: valid value 0,1,2,3,4,9,10";
       int interpolation_method = GetInterMethod(param_.inter_method,
                     res.cols, res.rows, new_width, new_height, prnd);
       cv::warpAffine(res, temp_, M, cv::Size(new_width, new_height),
@@ -462,7 +462,7 @@ class DefaultImageAugmenter : public ImageAugmenter {
       float alpha_s = 1.0 + std::uniform_real_distribution<float>(-param_.saturation,
                                                                   param_.saturation)(*prnd);
       int rand_order[3] = {0, 1, 2};
-      std::random_shuffle(std::begin(rand_order), std::end(rand_order));
+      std::shuffle(std::begin(rand_order), std::end(rand_order), *prnd);
       for (int i : rand_order) {
         if (i == 0) {
           // brightness

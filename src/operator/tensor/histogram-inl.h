@@ -34,6 +34,8 @@
 #include <nnvm/node.h>
 #include <nnvm/op_attr_types.h>
 #include <vector>
+#include <string>
+#include <unordered_map>
 #include <type_traits>
 #include "./util/tensor_util-inl.h"
 #include "../elemwise_op_common.h"
@@ -45,22 +47,30 @@ namespace mxnet {
 namespace op {
 
 struct HistogramParam : public dmlc::Parameter<HistogramParam> {
-    dmlc::optional<int> bin_cnt;
-    dmlc::optional<nnvm::Tuple<double>> range;
-    DMLC_DECLARE_PARAMETER(HistogramParam) {
-      DMLC_DECLARE_FIELD(bin_cnt)
-        .set_default(dmlc::optional<int>())
-        .describe("Number of bins for uniform case");
-      DMLC_DECLARE_FIELD(range)
-        .set_default(dmlc::optional<nnvm::Tuple<double>>())
-        .describe("The lower and upper range of the bins. if not provided, "
-                  "range is simply (a.min(), a.max()). values outside the "
-                  "range are ignored. the first element of the range must be "
-                  "less than or equal to the second. range affects the automatic "
-                  "bin computation as well. while bin width is computed to be "
-                  "optimal based on the actual data within range, the bin count "
-                  "will fill the entire range including portions containing no data.");
-    }
+  dmlc::optional<int> bin_cnt;
+  dmlc::optional<mxnet::Tuple<double>> range;
+  DMLC_DECLARE_PARAMETER(HistogramParam) {
+    DMLC_DECLARE_FIELD(bin_cnt)
+      .set_default(dmlc::optional<int>())
+      .describe("Number of bins for uniform case");
+    DMLC_DECLARE_FIELD(range)
+      .set_default(dmlc::optional<mxnet::Tuple<double>>())
+      .describe("The lower and upper range of the bins. if not provided, "
+                "range is simply (a.min(), a.max()). values outside the "
+                "range are ignored. the first element of the range must be "
+                "less than or equal to the second. range affects the automatic "
+                "bin computation as well. while bin width is computed to be "
+                "optimal based on the actual data within range, the bin count "
+                "will fill the entire range including portions containing no data.");
+  }
+
+  void SetAttrDict(std::unordered_map<std::string, std::string>* dict) {
+    std::ostringstream bin_cnt_s, range_s;
+    bin_cnt_s << bin_cnt;
+    range_s << range;
+    (*dict)["bin_cnt"] = bin_cnt_s.str();
+    (*dict)["range"] = range_s.str();
+  }
 };
 
 struct FillBinBoundsKernel {
@@ -86,9 +96,9 @@ inline bool HistogramOpShape(const nnvm::NodeAttrs& attrs,
   if (has_cnt) {
     // if cnt is specified, the output histogram has shape (cnt,)
     // while output bins has shape (cnt+1,)
-    const int bin_cnt = param.bin_cnt.value();
-    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape({bin_cnt}));
-    SHAPE_ASSIGN_CHECK(*out_attrs, 1, mxnet::TShape({bin_cnt + 1}));
+    const dim_t bin_cnt = param.bin_cnt.value();
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape(1, bin_cnt));
+    SHAPE_ASSIGN_CHECK(*out_attrs, 1, mxnet::TShape(1, bin_cnt + 1));
   } else {
     // if cnt is not specified, the output histogram has shape (bins.Size() - 1)
     // while output bins has same shape as input bins
@@ -97,11 +107,11 @@ inline bool HistogramOpShape(const nnvm::NodeAttrs& attrs,
     CHECK_EQ(oshape.ndim(), 1U) << "bins argument should be an 1D vector";
     CHECK_GE(oshape.Size(), 2U) << "number of bounds should be >= 2";
 
-    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape({(oshape[0] - 1)}));
+    SHAPE_ASSIGN_CHECK(*out_attrs, 0, mxnet::TShape(1, oshape[0] - 1));
     SHAPE_ASSIGN_CHECK(*out_attrs, 1, in_attrs->at(1));
   }
 
-  return !shape_is_none(out_attrs->at(0)) && !shape_is_none(out_attrs->at(1)) &&
+  return shape_is_known(out_attrs->at(0)) && shape_is_known(out_attrs->at(1)) &&
          out_attrs->at(0).Size() == out_attrs->at(1).Size() - 1;
 }
 

@@ -16,7 +16,6 @@
 # under the License.
 
 """Interface to runtime cuda kernel compile module."""
-from __future__ import absolute_import
 
 from array import array
 import re
@@ -172,7 +171,8 @@ class CudaModule(object):
 
 class CudaKernel(object):
     """Constructs CUDA kernel. Should be created by `CudaModule.get_kernel`,
-    not intended to be used by users."""
+    not intended to be used by users.
+    """
     def __init__(self, handle, name, is_ndarray, dtypes):
         self.handle = handle
         self._name = name

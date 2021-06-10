@@ -26,7 +26,7 @@
 #include <vector>
 #include "quantization_utils.h"
 #include "../nn/fully_connected-inl.h"
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 #include "../nn/mkldnn/mkldnn_fully_connected-inl.h"
 #include "mkldnn/mkldnn_quantized_ops-inl.h"
 #endif
@@ -47,9 +47,10 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_shape->size(), num_inputs * 3);
   CHECK_EQ(out_shape->size(), 3U);
 
-  CHECK(!shape_is_none(in_shape->at(0)))
-    << "QuantizedFullyConnectedOp input data shape must be given";
-  const mxnet::TShape& dshape = in_shape->at(0);
+  mxnet::TShape dshape = (*in_shape)[0];
+  // require data ndim to be known
+  if (!mxnet::ndim_is_known(dshape)) return false;
+
   index_t num_input;
   if (!param.flatten) {
     num_input = dshape[dshape.ndim() - 1];
@@ -57,7 +58,7 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
     num_input = dshape.ProdShape(1, dshape.ndim());
   }
 
-  TShape wshape = Shape2(param.num_hidden, num_input);
+  mxnet::TShape wshape = Shape2(param.num_hidden, num_input);
   SHAPE_ASSIGN_CHECK(*in_shape, 1, wshape);
   if (!param.no_bias) {
     mxnet::TShape bshape = Shape1(param.num_hidden);
@@ -65,18 +66,23 @@ bool QuantizedFullyConnectedShape(const nnvm::NodeAttrs& attrs,
   }
 
   for (size_t i = num_inputs; i < 3 * num_inputs; ++i) {
-    SHAPE_ASSIGN_CHECK(*in_shape, i, mxnet::TShape{1});
+    SHAPE_ASSIGN_CHECK(*in_shape, i, mxnet::TShape(1, 1));
   }
 
   if (!param.flatten) {
-    TShape result_shape(dshape);
+    mxnet::TShape result_shape(dshape);
     result_shape[dshape.ndim() - 1] = param.num_hidden;
     SHAPE_ASSIGN_CHECK(*out_shape, 0, result_shape);
   } else {
     SHAPE_ASSIGN_CHECK(*out_shape, 0, Shape2(dshape[0], param.num_hidden));
   }
-  SHAPE_ASSIGN_CHECK(*out_shape, 1, mxnet::TShape({1}));
-  SHAPE_ASSIGN_CHECK(*out_shape, 2, mxnet::TShape({1}));
+  SHAPE_ASSIGN_CHECK(*out_shape, 1, mxnet::TShape(1, 1));
+  SHAPE_ASSIGN_CHECK(*out_shape, 2, mxnet::TShape(1, 1));
+
+  if ((*out_shape)[0].ndim() > 0) {
+    dshape[0] = ((*out_shape)[0])[0];
+    SHAPE_ASSIGN_CHECK(*in_shape, 0, dshape);
+  }
   return true;
 }
 
@@ -88,7 +94,7 @@ bool QuantizedFullyConnectedType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_type->size(), num_inputs * 3);
   CHECK_EQ(out_type->size(), 3U);
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   CHECK(in_type->at(0) == mshadow::kInt8 || in_type->at(0) == mshadow::kUint8)
       << "QuantizedFullyConnected only supports int8/uint8 input, while "
       << in_type->at(0) << " is given.";
@@ -118,7 +124,7 @@ bool QuantizedFullyConnectedStorageType(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(in_attrs->size(), num_inputs * 3);
   CHECK_EQ(out_attrs->size(), 3U);
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   return MKLDNNStorageType(attrs, dev_mask, true,
                            dispatch_mode, in_attrs, out_attrs);
 #else
@@ -148,7 +154,7 @@ struct QuantizedSumInitKernelWithBias {
                                   const float *max_out, const float *min_bias,
                                   const float *max_bias) {
     typedef int32_t T1;
-    typedef int8_t  T2;
+    using T2 = int8_t;
     using mshadow::red::limits::MinValue;
     using mshadow::red::limits::MaxValue;
     float float_for_one_out_quant  =
@@ -233,7 +239,7 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
   Tensor<cpu, 1, float> max_weight =
     in_data[num_inputs + quantized_fullc::kWeightMax].get<cpu, 1, float>(s);
 
-  Kernel<QuantizationRangeForMultiplicationStruct, cpu>::Launch(s, 1, min_output.dptr_,
+  Kernel<QuantizationRangeForS8S8MultiplicationStruct, cpu>::Launch(s, 1, min_output.dptr_,
       max_output.dptr_, min_data.dptr_, max_data.dptr_, min_weight.dptr_, max_weight.dptr_);
   if (!param.no_bias) {
     Tensor<cpu, 1, int8_t> bias = in_data[fullc::kBias].get_with_shape<cpu, 1, int8_t>(
@@ -286,7 +292,7 @@ void QuantizedFullyConnectedForwardCPU(const nnvm::NodeAttrs& attrs,
 #endif
 }
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 void QuantizedFullyConnectedForwardExCPU(const nnvm::NodeAttrs &attrs,
                                          const OpContext &ctx,
                                          const std::vector<NDArray> &in_data,
@@ -335,7 +341,7 @@ and max thresholds representing the threholds for quantizing the float32 output 
 .set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
 .set_attr<FNeedRequantize>("FNeedRequantize", [](const NodeAttrs& attrs) { return true; })
 .set_attr<FCompute>("FCompute<cpu>", QuantizedFullyConnectedForwardCPU)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FComputeEx>("FComputeEx<cpu>", QuantizedFullyConnectedForwardExCPU)
 #endif
@@ -355,8 +361,11 @@ and max thresholds representing the threholds for quantizing the float32 output 
 .add_arguments(FullyConnectedParam::__FIELDS__());
 
 NNVM_REGISTER_OP(FullyConnected)
+.set_attr<FQuantizable>("FQuantizable", [](const NodeAttrs& attrs) {
+    return QuantizeType::kMust;
+})
 .set_attr<FQuantizedOp>("FQuantizedOp", [](const NodeAttrs& attrs) {
-    nnvm::NodePtr node = nnvm::Node::Create();
+    nnvm::ObjectPtr node = nnvm::Node::Create();
     node->attrs.op = Op::Get("_contrib_quantized_fully_connected");
     node->attrs.name = "quantized_" + attrs.name;
     node->attrs.dict = attrs.dict;

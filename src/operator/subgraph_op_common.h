@@ -67,7 +67,7 @@ bool is_type_udf(const int &x);
 
 template <typename T>
 void extract_by_loc(const std::vector<T> &array,
-                    const nnvm::Tuple<dim_t> input_locs,
+                    const mxnet::Tuple<dim_t> input_locs,
                     std::vector<T> *out) {
   out->clear();
   out->reserve(input_locs.ndim());
@@ -94,11 +94,11 @@ bool fill_value(T *x, T *y, bool x_empty, bool y_empty) {
 }
 
 template <typename T>
-bool sync_in_in(const nnvm::Tuple<dim_t> &input_locs,
-                         std::vector<T> *in,
-                         std::vector<T> *subg_in,
-                         std::function<bool(const T &)> is_empty) {
-  for (size_t i = 0; i < input_locs.ndim(); ++i) {
+bool sync_in_in(const mxnet::Tuple<dim_t> &input_locs,
+                std::vector<T> *in,
+                std::vector<T> *subg_in,
+                std::function<bool(const T &)> is_empty) {
+  for (int i = 0; i < input_locs.ndim(); ++i) {
     T &x = in->at(input_locs[i]);
     T &y = subg_in->at(i);
     fill_value(&x, &y, is_empty(x), is_empty(y));
@@ -135,11 +135,11 @@ class LoopState {
   // which will be used in the backward.
   std::vector<OpStatePtr> all_states;
   CachedOpPtr iter_op;
-  Symbol subgraph_sym;
+  nnvm::Symbol subgraph_sym;
   nnvm::Graph subgraph;
 
  public:
-  explicit LoopState(const Symbol &g);
+  explicit LoopState(const nnvm::Symbol &g, bool is_dynamic = true);
 
   void Forward(int iter_no,
                const std::vector<NDArray> &inputs,
@@ -155,15 +155,19 @@ class LoopState {
     all_inputs.clear();
     all_states.clear();
   }
-  static CachedOpPtr MakeSharedOp(const Symbol &sym) {
+  static CachedOpPtr MakeSharedOp(const nnvm::Symbol &sym, bool is_dynamic = true) {
     // We turn on static_alloc for two reasons.
     // It avoids the overhead of unnecessary memory allocation.
     // only static_alloc supports nested call of CachedOp.
     std::vector<std::pair<std::string, std::string> > kwargs = {
       {"inline_limit", "0"},
-      {"static_alloc", "1"},
-      {"is_dynamic", "1"}
+      {"static_alloc", "1"}
     };
+    if (is_dynamic) {
+      kwargs.push_back({"is_dynamic", "1"});
+    } else {
+      kwargs.push_back({"is_dynamic", "0"});
+    }
     return std::make_shared<CachedOp>(sym, kwargs);
   }
 };

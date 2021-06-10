@@ -26,7 +26,7 @@
 
 #include "./lrn-inl.h"
 #include "../operator_common.h"
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 #include "./mkldnn/mkldnn_lrn-inl.h"
 #include "./mkldnn/mkldnn_base-inl.h"
 #endif
@@ -40,7 +40,7 @@ bool LRNShape(const nnvm::NodeAttrs& attrs,
   using namespace mshadow;
   CHECK_EQ(in_shape->size(), 1U) << "Input:[data]";
   const mxnet::TShape &dshape = in_shape->at(0);
-  if (dshape.ndim() == 0) return false;
+  if (!shape_is_known(dshape)) return false;
   out_shape->clear();
   out_shape->push_back(dshape);
   out_shape->push_back(dshape);
@@ -72,17 +72,17 @@ bool LRNType(const nnvm::NodeAttrs& attrs,
 
 struct LRNGrad {
   const char *op_name;
-  std::vector<nnvm::NodeEntry> operator()(const nnvm::NodePtr& n,
+  std::vector<nnvm::NodeEntry> operator()(const nnvm::ObjectPtr& n,
                 const std::vector<nnvm::NodeEntry>& ograds) const {
     std::vector<nnvm::NodeEntry> heads;
     heads.push_back(ograds[0]);  // out_grad
     heads.push_back(n->inputs[lrn_enum::kData]);
-    heads.emplace_back(nnvm::NodeEntry{n, lrn_enum::kTmpNorm, 0});
+    heads.emplace_back(n, lrn_enum::kTmpNorm, 0);
     return MakeGradNode(op_name, n, heads, n->attrs.dict);
   }
 };
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 bool LRNForwardInferStorageType(const nnvm::NodeAttrs& attrs,
                                 const int dev_mask,
                                 DispatchMode* dispatch_mode,
@@ -110,11 +110,10 @@ void LRNComputeExCPU(const nnvm::NodeAttrs &attrs,
                      const std::vector<NDArray> &inputs,
                      const std::vector<OpReqType> &req,
                      const std::vector<NDArray> &outputs) {
-  const LRNParam &param = nnvm::get<LRNParam>(attrs.parsed);
   if (SupportMKLDNN(inputs[0])) {
     // We only need to test one output array.
     MKLDNN_OPCHECK_INIT(false, 1, inputs, outputs);
-    MKLDNNLRNForward(ctx, param, inputs[0], req[0], outputs[0]);
+    MKLDNNRun(MKLDNNLRNForward, attrs, ctx, inputs[0], req[0], outputs[0]);
     MKLDNN_OPCHECK_RUN(LRNCompute<cpu>, attrs, ctx, inputs, req, outputs);
     // Copy outputs[1] from opcheck reference as backward check needs it.
     MKLDNN_OPCHECK_COPY_RESULT(outputs, std::vector<size_t>{1});
@@ -128,14 +127,9 @@ void LRNGradComputeExCPU(const nnvm::NodeAttrs &attrs,
                          const std::vector<NDArray> &inputs,
                          const std::vector<OpReqType> &req,
                          const std::vector<NDArray> &outputs) {
-  const LRNParam &param = nnvm::get<LRNParam>(attrs.parsed);
-  const NDArray &out_grad = inputs[0];
-  const NDArray &in_data = inputs[1];
-  const NDArray &in_grad = outputs[0];
-
   if (SupportMKLDNN(inputs[0])) {
     MKLDNN_OPCHECK_INIT(true, outputs.size(), inputs, outputs);
-    MKLDNNLRNBackward(ctx, param, out_grad, in_data, req[0], in_grad);
+    MKLDNNRun(MKLDNNLRNBackward, attrs, ctx, inputs, req, outputs);
     MKLDNN_OPCHECK_RUN(LRNGradCompute<cpu>, attrs, ctx, inputs, req, outputs);
     return;
   }
@@ -169,7 +163,7 @@ number of kernels in the layer.
 .set_attr_parser(ParamParser<LRNParam>)
 .set_attr<mxnet::FInferShape>("FInferShape", LRNShape)
 .set_attr<nnvm::FInferType>("FInferType", LRNType)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<FInferStorageType>("FInferStorageType", LRNForwardInferStorageType)
 #endif
 .set_attr<nnvm::FListInputNames>("FListInputNames",
@@ -181,7 +175,7 @@ number of kernels in the layer.
   return std::vector<std::string>{"output", "tmp_norm"};
 })
 .set_attr<FCompute>("FCompute<cpu>", LRNCompute<cpu>)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FComputeEx>("FComputeEx<cpu>", LRNComputeExCPU)
 #endif
@@ -190,13 +184,14 @@ number of kernels in the layer.
 .add_arguments(LRNParam::__FIELDS__());
 
 NNVM_REGISTER_OP(_backward_LRN)
+.set_num_inputs(3)
 .set_num_outputs(1)
 .set_attr_parser(ParamParser<LRNParam>)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<FInferStorageType>("FInferStorageType", LRNBackwardInferStorageType)
 #endif
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 .set_attr<bool>("TIsMKLDNN", true)
 .set_attr<FComputeEx>("FComputeEx<cpu>", LRNGradComputeExCPU)
 // Native compute requires norm while MKLDNN does not so cannot be compared in debug mode

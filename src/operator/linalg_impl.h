@@ -29,7 +29,8 @@
 
 #include <algorithm>
 
-#include "../common/cuda_utils.h"
+#include "../common/cuda/utils.h"
+#include "mxnet_op.h"
 
 // Convenience functions.
 inline void linalg_check_batch_size(int A, int B, int C) {
@@ -37,6 +38,13 @@ inline void linalg_check_batch_size(int A, int B, int C) {
   CHECK_EQ(A, C) << "Inconsistent batch size between arguments to linear algebra operator";
   CHECK_GT(A, 0) << "Zero batch size for arguments to linear algebra operator";
 }
+
+#ifdef __CUDACC__
+#define EPHEMERAL_GPU_STORAGE_ALLOC(func, var, dtype, size) \
+  Storage::Handle var = Storage::Get()->Alloc(sizeof(dtype) * size, Context::GPU()); \
+  var.profiler_scope = "<ephemeral>:"; \
+  var.name = #func"_"#var;
+#endif
 
 //////////////////////////////// GEMM ////////////////////////////////////////////
 
@@ -204,12 +212,15 @@ inline void linalg_gemm<gpu, float>(const Tensor<gpu, 2, float>& A,
 #else
   cublasDataType_t full_datatype = CUBLAS_DATA_FULL;
 #endif
+  auto handle = Stream<gpu>::GetBlasHandle(s);
+  cublasMath_t saved_math_mode = SetCublasMathMode(handle, VERSION_ADJUSTED_TF32_MATH);
   CUBLAS_CALL(cublasSgemmEx(
-      Stream<gpu>::GetBlasHandle(s), (tB ? CUBLAS_OP_T : CUBLAS_OP_N),
+      handle, (tB ? CUBLAS_OP_T : CUBLAS_OP_N),
       (tA ? CUBLAS_OP_T : CUBLAS_OP_N), C.size(1), C.size(0),
       (tB ? B.size(1) : B.size(0)), &alpha, B.dptr_, full_datatype, B.stride_,
       A.dptr_, full_datatype, A.stride_, &beta, C.dptr_, full_datatype,
-      C.stride_))
+      C.stride_));
+  CUBLAS_CALL(cublasSetMathMode(handle, saved_math_mode));
 }
 
 #else
@@ -227,13 +238,16 @@ void linalg_gemm_axis<gpu, DType>(const Tensor<gpu, 3, DType>& A, const Tensor<g
   using mshadow::gpu; \
   CHECK_NOTNULL(s); \
   linalg_check_batch_size(A.size(1), B.size(1), C.size(1)); \
-  CUBLAS_CALL(cublas##fname(Stream<gpu>::GetBlasHandle(s), \
+  auto handle = Stream<gpu>::GetBlasHandle(s); \
+  cublasMath_t saved_math_mode = SetCublasMathMode(handle, VERSION_ADJUSTED_TF32_MATH); \
+  CUBLAS_CALL(cublas##fname(handle, \
                             (tB ? CUBLAS_OP_T : CUBLAS_OP_N), \
                             (tA ? CUBLAS_OP_T : CUBLAS_OP_N), \
                             C.size(2), C.size(0), (tB ? B.size(2) : B.size(0)), &alpha, \
                             B.dptr_, B.size(1)*B.stride_, B.stride_, \
                             A.dptr_, A.size(1)*A.stride_, A.stride_, &beta, \
                             C.dptr_, C.size(1)*C.stride_, C.stride_, A.size(1))) \
+  CUBLAS_CALL(cublasSetMathMode(handle, saved_math_mode)); \
 }
 LINALG_GPU_GEMM_AXIS(SgemmStridedBatched, float)
 LINALG_GPU_GEMM_AXIS(DgemmStridedBatched, double)
@@ -248,6 +262,7 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
                                              mshadow::half::half_t beta,
                                              bool tA, bool tB, Stream<gpu> *s) {
   using namespace mxnet;
+  using namespace mxnet::common::cuda;
   using mshadow::gpu;
   CHECK_NOTNULL(s);
   check_gemm(A, B, C, alpha, beta, tA, tB);
@@ -260,25 +275,59 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
   auto previous_math_mode = SetCublasMathMode(blas_handle, cublas_math_mode);
 #endif
 
-  // pseudo-fp16 (fp32 math with fp16 I/O)
-  float alpha_f = float(alpha);  // NOLINT(*)
-  float beta_f = float(beta);  // NOLINT(*)
-
-  // As of cuda8, cublas adopted the cuda datatype, rather than maintaining its own datatype.
+// As of cuda8, cublas adopted the cuda datatype, rather than maintaining its own datatype.
 #if CUDA_VERSION >= 8000
   cudaDataType_t half_datatype = CUDA_R_16F;
 #else
   cublasDataType_t half_datatype = CUBLAS_DATA_HALF;
 #endif
-  CUBLAS_CALL(cublasSgemmEx(blas_handle,
+  auto algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+  using TrueFP16Type = mshadow::half::half_t;
+  using PseudoFP16Type = typename CublasType<mshadow::half::half_t>::ScaleType;
+  TrueFP16Type trueFP16_alpha = static_cast<TrueFP16Type>(alpha);
+  TrueFP16Type trueFP16_beta = static_cast<TrueFP16Type>(beta);
+  PseudoFP16Type pseudoFP16_alpha = static_cast<PseudoFP16Type>(alpha);
+  PseudoFP16Type pseudoFP16_beta = static_cast<PseudoFP16Type>(beta);
+  const void *alpha_ptr;
+  const void *beta_ptr;
+  cudaDataType_t computeType;
+  bool use_true_fp16 = dmlc::GetEnv("MXNET_FC_TRUE_FP16", false);
+  if (use_true_fp16) {
+    alpha_ptr = &trueFP16_alpha;
+    beta_ptr = &trueFP16_beta;
+    computeType = CublasType<TrueFP16Type>::kCudaFlag;
+  } else {
+    alpha_ptr = &pseudoFP16_alpha;
+    beta_ptr = &pseudoFP16_beta;
+    computeType = CublasType<PseudoFP16Type>::kCudaFlag;
+  }
+  if (SupportsFloat16Compute(s->dev_id)) {
+    CUBLAS_CALL(cublasGemmEx(blas_handle,
                             (tB ? CUBLAS_OP_T : CUBLAS_OP_N),
                             (tA ? CUBLAS_OP_T : CUBLAS_OP_N),
                             C.size(1), C.size(0), (tB ? B.size(1) : B.size(0)),
-                            &alpha_f,
+                            alpha_ptr,
                             B.dptr_, half_datatype, B.stride_,
                             A.dptr_, half_datatype, A.stride_,
-                            &beta_f,
-                            C.dptr_, half_datatype, C.stride_));
+                            beta_ptr,
+                            C.dptr_, half_datatype, C.stride_,
+                            computeType, algo));
+  } else {
+    // pseudo-fp16 (fp32 math with fp16 I/O)
+    if (use_true_fp16)
+      common::LogOnce("MXNET_FC_TRUE_FP16 was set but this architecture does not support it.");
+    float alpha_f = static_cast<float>(alpha);
+    float beta_f = static_cast<float>(beta);
+    CUBLAS_CALL(cublasSgemmEx(blas_handle,
+                             (tB ? CUBLAS_OP_T : CUBLAS_OP_N),
+                             (tA ? CUBLAS_OP_T : CUBLAS_OP_N),
+                             C.size(1), C.size(0), (tB ? B.size(1) : B.size(0)),
+                             &alpha_f,
+                             B.dptr_, half_datatype, B.stride_,
+                             A.dptr_, half_datatype, A.stride_,
+                             &beta_f,
+                             C.dptr_, half_datatype, C.stride_));
+  }
 #if CUDA_VERSION >= 9000
   SetCublasMathMode(blas_handle, previous_math_mode);
 #endif
@@ -306,13 +355,22 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
     linalg_check_batch_size(A.size(0), B.size(0), C.size(0)); \
     check_gemm(A[0], B[0], C[0], alpha, beta, tA, tB); \
     using namespace mshadow::cuda; \
-    CUBLAS_CALL(cublas##fname(Stream<gpu>::GetBlasHandle(s), \
+    auto handle = Stream<gpu>::GetBlasHandle(s); \
+    cublasMath_t saved_math_mode = SetCublasMathMode(handle, VERSION_ADJUSTED_TF32_MATH); \
+    CUBLAS_CALL(cublas##fname(handle, \
                               (tB ? CUBLAS_OP_T : CUBLAS_OP_N), \
                               (tA ? CUBLAS_OP_T : CUBLAS_OP_N), \
                               C.size(2), C.size(1), (tB ? B.size(2) : B.size(1)), \
-                              &alpha, B.dptr_, B.stride_, B.size(1) * B.stride_, \
-                              A.dptr_,  A.stride_, A.size(1) * A.stride_, \
-                              &beta, C.dptr_, C.stride_, C.size(1) * C.stride_, A.size(0))) \
+                              &alpha, \
+                              B.dptr_, B.stride_, \
+                              static_cast<int64_t>(B.size(1) * B.stride_), \
+                              A.dptr_,  A.stride_, \
+                              static_cast<int64_t>(A.size(1) * A.stride_), \
+                              &beta, \
+                              C.dptr_, C.stride_, \
+                              static_cast<int64_t>(C.size(1) * C.stride_), \
+                              A.size(0))) \
+    CUBLAS_CALL(cublasSetMathMode(handle, saved_math_mode)); \
   }
 
   LINALG_GPU_BATCH_GEMM(DgemmStridedBatched, double)
@@ -337,7 +395,7 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
 
       using namespace mshadow::cuda;
       auto cublas_math_mode =
-          use_tensor_ops ? CUBLAS_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+          use_tensor_ops ? CUBLAS_TENSOR_OP_MATH : VERSION_ADJUSTED_TF32_MATH;
       auto previous_math_mode = SetCublasMathMode(blas_handle, cublas_math_mode);
 
       // cublasGemmStridedBatchedEx is only supported for GPU with architecture
@@ -378,6 +436,8 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
     CHECK_NOTNULL(s); \
     linalg_check_batch_size(A.size(0), B.size(0), C.size(0)); \
     linalg_check_batch_size(A.size(2), B.size(2), C.size(2)); \
+    auto handle = Stream<gpu>::GetBlasHandle(s);                                           \
+    cublasMath_t saved_math_mode = SetCublasMathMode(handle, VERSION_ADJUSTED_TF32_MATH); \
     for (index_t i = 0; i < A.size(2); ++i) { \
       CUBLAS_CALL(cublas##fname(Stream<gpu>::GetBlasHandle(s), \
           (tB ? CUBLAS_OP_T : CUBLAS_OP_N), \
@@ -387,6 +447,7 @@ void linalg_gemm<gpu, mshadow::half::half_t>(const Tensor<gpu, 2, mshadow::half:
           A.dptr_+i*A.stride_, A.size(2) * A.stride_, A.size(1)*A.size(2)*A.stride_, &beta, \
           C.dptr_+i*C.stride_, C.size(2) * C.stride_, C.size(1)*C.size(2)*C.stride_, A.size(0))) \
     }\
+    SetCublasMathMode(handle, saved_math_mode); \
   }
 
   LINALG_GPU_BATCH_GEMM_AXIS(SgemmStridedBatched, float)
@@ -724,8 +785,9 @@ void linalg_potrf<gpu, DType>(const Tensor<gpu, 2, DType>& A, bool lower, Stream
   CHECK_NOTNULL(s); \
   check_potrf(A, lower); \
   int buffsize(linalg_potrf_buffsize(A, lower, s)); \
-  Storage::Handle buffer = Storage::Get()->Alloc(sizeof(DType)*buffsize, Context::GPU()); \
-  Storage::Handle info = Storage::Get()->Alloc(sizeof(int), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_potrf, buffer, \
+      DType, buffsize); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_potrf, info, int, 1); \
   CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
                 (lower ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER), \
                 A.size(0), A.dptr_, A.stride_, static_cast<DType *>(buffer.dptr), buffsize, \
@@ -745,8 +807,9 @@ void linalg_batch_potrf<gpu, DType>(const Tensor<gpu, 3, DType>& A, bool lower, 
   CHECK_GT(A.size(0), 0); \
   check_potrf(A[0], lower); \
   int buffsize(linalg_potrf_buffsize(A[0], lower, s)); \
-  Storage::Handle buffer = Storage::Get()->Alloc(sizeof(DType)*buffsize, Context::GPU()); \
-  Storage::Handle info = Storage::Get()->Alloc(sizeof(int), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_potrf, buffer, \
+      DType, buffsize); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_potrf, info, int, 1); \
   for (mshadow::index_t i = 0; i < A.size(0); ++i) { \
     CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
                  (lower ? CUBLAS_FILL_MODE_UPPER : CUBLAS_FILL_MODE_LOWER), \
@@ -817,7 +880,8 @@ void linalg_potri<gpu, DType>(const Tensor<gpu, 2, DType>& A, bool lower, Stream
   using namespace mxnet; \
   CHECK_NOTNULL(s); \
   check_potri(A, lower); \
-  Storage::Handle buffer = Storage::Get()->Alloc(sizeof(DType)*A.MSize(), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_potri, buffer, \
+      DType, A.MSize()); \
   using namespace mshadow::cuda; \
   int ngrid = std::min(kMaxGridNum, \
                        static_cast<int>((A.MSize() + kBaseThreadNum - 1) / kBaseThreadNum)); \
@@ -841,7 +905,8 @@ void linalg_batch_potri<gpu, DType>(const Tensor<gpu, 3, DType>& A, bool lower, 
   CHECK_NOTNULL(s); \
   CHECK_GT(A.size(0), 0); \
   check_potri(A[0], lower); \
-  Storage::Handle buffer = Storage::Get()->Alloc(sizeof(DType)*A.MSize(), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_potri, buffer, \
+      DType, A.MSize()); \
   using namespace mshadow::cuda; \
   int ngrid = std::min(kMaxGridNum, \
                        static_cast<int>((A.MSize() + kBaseThreadNum - 1) / kBaseThreadNum)); \
@@ -1023,7 +1088,7 @@ void linalg_gelqf<gpu, DType>(const Tensor<gpu, 2, DType>& A, \
   check_gelqf(A, work); \
   int m(A.size(0)); \
   int lwork(work.size(0) - m); \
-  Storage::Handle info = Storage::Get()->Alloc(sizeof(int), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_gelqf, info, int, 1); \
   CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
                 A.size(1), m, A.dptr_ , A.stride_, work.dptr_, \
                 work.dptr_ + m, lwork, static_cast<int *>(info.dptr))); \
@@ -1047,7 +1112,7 @@ void linalg_orglq<gpu, DType>(const Tensor<gpu, 2, DType>& A, \
   check_gelqf(A, work); \
   int m(A.size(0)); \
   int lwork(work.size(0) - m); \
-  Storage::Handle info = Storage::Get()->Alloc(sizeof(int), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_orglq, info, int, 1); \
   CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
                 A.size(1), m, m, A.dptr_ , A.stride_, work.dptr_, \
                 work.dptr_ + m, lwork, static_cast<int *>(info.dptr))); \
@@ -1083,7 +1148,8 @@ int linalg_gelqf_workspace_query<gpu, DType>(const Tensor<gpu, 2, DType>& A, \
   CUSOLVER_CALL(cusolverDn##prefix##geqrf_bufferSize(Stream<gpu>::GetSolverHandle(s), \
                 A.size(1), m, A.dptr_ , A.stride_, &work1)); \
   int work2(0);  \
-  Storage::Handle tau = Storage::Get()->Alloc(sizeof(DType), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_gelqf_workspace_query, \
+      tau, DType, 1); \
   CUSOLVER_CALL(cusolverDn##prefix##orgqr_bufferSize(Stream<gpu>::GetSolverHandle(s), \
                 A.size(1), m, m, A.dptr_ , A.stride_, static_cast<DType *>(tau.dptr), &work2)); \
   Storage::Get()->Free(tau); \
@@ -1128,12 +1194,19 @@ void linalg_syevd<cpu, DType>(const Tensor<cpu, 2, DType>& A, \
                               const Tensor<cpu, 1, DType>& work, \
                               Stream<cpu> *s) { \
   check_syevd(A, L); \
-  int liwork(0); \
+  DType workTmp(0); \
+  lapack_index_t liwork(0); \
   MXNET_LAPACK_##fname(MXNET_LAPACK_ROW_MAJOR, 'L', A.size(0), \
-                       A.dptr_, A.stride_, L.dptr_, work.dptr_, -1, &liwork, \
-                      -1); \
-  int lwork(static_cast<int>(*work.dptr_)); \
-  int *iwork = static_cast<int*>(static_cast<void*>(work.dptr_ + lwork)); \
+                       A.dptr_, A.stride_, L.dptr_, &workTmp, -1, \
+                       &liwork, -1); \
+  lapack_index_t lwork = static_cast<lapack_index_t>(workTmp); \
+  if /*constexpr*/ (sizeof(lapack_index_t) > sizeof(DType)) { \
+    /* For alligning iwork pointer address */ \
+    constexpr lapack_index_t round_mask = \
+      static_cast<lapack_index_t>(sizeof(lapack_index_t) / sizeof(DType)) - 1; \
+    lwork = (lwork + round_mask) & ~round_mask; \
+  }\
+  lapack_index_t *iwork = static_cast<lapack_index_t *>(static_cast<void *>(work.dptr_ + lwork)); \
   int ret(MXNET_LAPACK_##fname(MXNET_LAPACK_ROW_MAJOR, 'L', A.size(0), \
                                A.dptr_, A.stride_, L.dptr_, work.dptr_, \
                                lwork, iwork, liwork)); \
@@ -1150,16 +1223,29 @@ LINALG_CPU_SYEVD(dsyevd, double)
 // to the work space query on GPU.
 #define LINALG_CPU_SYEVD_WORKSPACE_QUERY(func, DType) \
 template<> inline \
-int linalg_syevd_workspace_query<cpu, DType>(const Tensor<cpu, 2, DType>& A, \
+lapack_index_t linalg_syevd_workspace_query<cpu, DType>(const Tensor<cpu, 2, DType>& A, \
                                              const Tensor<cpu, 1, DType>& L, \
                                              Stream<cpu> *s) { \
-  DType work(0.0); \
-  int iwork(0); \
+  DType work(0); \
+  lapack_index_t liwork(0); \
   MXNET_LAPACK_##func(MXNET_LAPACK_ROW_MAJOR, 'L', A.size(0), \
-                      A.dptr_, A.stride_, L.dptr_, &work, -1, &iwork, \
+                      A.dptr_, A.stride_, L.dptr_, &work, -1, &liwork, \
                       -1); \
-  iwork = (sizeof(int) * iwork + sizeof(DType) - 1) / sizeof(DType); \
-  return static_cast<int>(work) + iwork; \
+  lapack_index_t lwork = static_cast<lapack_index_t>(work); \
+  if /*constexpr*/ (sizeof(DType) != sizeof(lapack_index_t)) { \
+    if /*constexpr*/ (sizeof(DType) > sizeof(lapack_index_t)) { \
+      /* Convert memory size needed for liwork to lwork units [Dtype] */ \
+      liwork = (sizeof(lapack_index_t) * liwork + sizeof(DType) - 1) / sizeof(DType); \
+    } else { \
+      /* Convert memory size needed for liwork to lwork units [Dtype] */ \
+      liwork *= sizeof(lapack_index_t) / sizeof(DType); \
+      /* For alligning iwork pointer address */ \
+      constexpr lapack_index_t round_mask = \
+        static_cast<lapack_index_t>(sizeof(lapack_index_t) / sizeof(DType)) - 1; \
+      lwork = (lwork + round_mask) & ~round_mask; \
+    } \
+  } \
+  return lwork + liwork; \
 }
 LINALG_CPU_SYEVD_WORKSPACE_QUERY(ssyevd, float)
 LINALG_CPU_SYEVD_WORKSPACE_QUERY(dsyevd, double)
@@ -1181,7 +1267,7 @@ void linalg_syevd<gpu, DType>(const Tensor<gpu, 2, DType>& A, \
   using mshadow::gpu; \
   CHECK_NOTNULL(s); \
   check_syevd(A, L); \
-  Storage::Handle info = Storage::Get()->Alloc(sizeof(int), Context::GPU()); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_syevd, info, int, 1); \
   CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
                 CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, \
                 A.size(0), A.dptr_ , A.stride_, L.dptr_, work.dptr_, \
@@ -1232,5 +1318,457 @@ LINALG_GPU_SYEVD_WORKSPACE_QUERY(DnSsyevd, float)
 LINALG_GPU_SYEVD_WORKSPACE_QUERY(DnDsyevd, double)
 
 #endif  // __CUDACC__
+
+//////////////////////////////// GESVD ////////////////////////////////////////////
+
+// CPU/GPU-versions of LAPACK function "gesvd"
+
+template<typename xpu, typename DType> inline
+void check_gesvd(const Tensor<xpu, 2, DType>& UT,
+                 const Tensor<xpu, 1, DType>& L,
+                 const Tensor<xpu, 2, DType>& V) {
+  // Any checking that helps user debug potential problems.
+  CHECK_LE(V.size(0), V.size(1))
+    << "The second to last dimension of A must be less or equal to the "
+    << "last dimension";
+  CHECK_EQ(UT.size(0), UT.size(1))
+    << "UT must be square matrix";
+  CHECK_EQ(V.size(0), L.size(0))
+    << "V, L have incompatible sizes";
+  CHECK_EQ(V.size(0), UT.size(0))
+    << "V, UT must have compatible sizes";
+}
+
+#define LINALG_CPU_GESVD(fname, DType) \
+template<> inline \
+void linalg_gesvd<cpu, DType>(const Tensor<cpu, 2, DType>& UT, \
+                              const Tensor<cpu, 1, DType>& L, \
+                              const Tensor<cpu, 2, DType>& V, \
+                              const Tensor<cpu, 1, DType>& work, \
+                              Stream<cpu> *s) { \
+  check_gesvd(UT, L, V); \
+  int lwork(work.size(0)); \
+  int ret(MXNET_LAPACK_##fname(MXNET_LAPACK_ROW_MAJOR, V.size(0), V.size(1), \
+                               UT.dptr_, UT.stride_, L.dptr_, V.dptr_, V.stride_, \
+                               work.dptr_, lwork)); \
+  CHECK_EQ(ret, 0) << #fname << " failed in lapack on cpu."; \
+}
+
+LINALG_CPU_GESVD(sgesvd, float)
+LINALG_CPU_GESVD(dgesvd, double)
+
+#define LINALG_CPU_GESVD_WORKSPACE_QUERY(func, DType) \
+template<> inline \
+size_t linalg_gesvd_workspace_query<cpu, DType>(const Tensor<cpu, 2, DType>& UT, \
+                                             const Tensor<cpu, 1, DType>& L, \
+                                             const Tensor<cpu, 2, DType>& V, \
+                                             Stream<cpu> *s) { \
+  DType work(0.0); \
+  MXNET_LAPACK_##func(MXNET_LAPACK_ROW_MAJOR, V.size(0), V.size(1), \
+                      UT.dptr_, UT.stride_, L.dptr_, V.dptr_, V.stride_, \
+                      &work, -1); \
+  return static_cast<size_t>(work); \
+}
+LINALG_CPU_GESVD_WORKSPACE_QUERY(sgesvd, float)
+LINALG_CPU_GESVD_WORKSPACE_QUERY(dgesvd, double)
+
+#ifdef __CUDACC__
+
+// GESVD only available with cuda8 or higher.
+#if CUDA_VERSION >= 8000
+
+#define LINALG_GPU_GESVD(fname, DType) \
+template<> inline \
+void linalg_gesvd<gpu, DType>(const Tensor<gpu, 2, DType>& UT, \
+                              const Tensor<gpu, 1, DType>& L, \
+                              const Tensor<gpu, 2, DType>& V, \
+                              const Tensor<gpu, 1, DType>& work, \
+                              Stream<gpu> *s) { \
+  using namespace mxnet; \
+  using mshadow::gpu; \
+  check_gesvd(UT, L, V); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_gesvd, info, int, 1); \
+  CUSOLVER_CALL(cusolver##fname(Stream<gpu>::GetSolverHandle(s), \
+                'O', 'S', V.size(1), V.size(0), V.dptr_, V.stride_, L.dptr_, V.dptr_, V.stride_, \
+                UT.dptr_, UT.stride_, work.dptr_, work.size(0), \
+                V.dptr_, static_cast<int *>(info.dptr))); \
+  Storage::Get()->Free(info); \
+}
+
+#define LINALG_GPU_GESVD_WORKSPACE_QUERY(fname, DType) \
+template<> inline \
+size_t linalg_gesvd_workspace_query<gpu, DType>(const Tensor<gpu, 2, DType>& UT, \
+                                             const Tensor<gpu, 1, DType>& L, \
+                                             const Tensor<gpu, 2, DType>& V, \
+                                             Stream<gpu> *s) { \
+  using namespace mxnet; \
+  using mshadow::gpu; \
+  int lwork(0); \
+  CUSOLVER_CALL(cusolver##fname##_bufferSize(Stream<gpu>::GetSolverHandle(s), \
+                                             V.size(1), V.size(0), &lwork)); \
+  return lwork; \
+}
+
+#else
+
+#define LINALG_GPU_GESVD(fname, DType) \
+template<> inline \
+void linalg_gesvd<gpu, DType>(const Tensor<gpu, 2, DType>& UT, \
+                              const Tensor<gpu, 1, DType>& L, \
+                              const Tensor<gpu, 2, DType>& V, \
+                              const Tensor<gpu, 1, DType>& work, \
+                              Stream<gpu> *s) { \
+  LOG(FATAL) << "gesvd requires CUDA version >= 8.0!"; \
+}
+
+#define LINALG_GPU_GESVD_WORKSPACE_QUERY(fname, DType) \
+template<> inline \
+size_t linalg_gesvd_workspace_query<gpu, DType>(const Tensor<gpu, 2, DType>& UT, \
+                                             const Tensor<gpu, 1, DType>& L, \
+                                             const Tensor<gpu, 2, DType>& V, \
+                                             Stream<gpu> *s) { \
+  LOG(FATAL) << "gesvd requires CUDA version >= 8.0!"; \
+  return 0; \
+}
+
+#endif  // CUDA_VERSION >= 8000
+
+LINALG_GPU_GESVD(DnSgesvd, float)
+LINALG_GPU_GESVD(DnDgesvd, double)
+
+LINALG_GPU_GESVD_WORKSPACE_QUERY(DnSgesvd, float)
+LINALG_GPU_GESVD_WORKSPACE_QUERY(DnDgesvd, double)
+
+#endif  // __CUDACC__
+
+//////////////////////////////// GETRF ////////////////////////////////////////////
+
+// CPU/GPU-versions of LAPACK function "getrf"
+
+// The input of this function should be col-major for performance.
+// Tensor work holds space for ipiv in getrf
+#define LINALG_CPU_GETRF(fname, DType) \
+template<> inline \
+void linalg_getrf<cpu, DType>(const Tensor<cpu, 2, DType>& A, \
+                              const Tensor<cpu, 1, lapack_index_t>& pivot, \
+                              bool check_singular, Stream<cpu> *s) { \
+  int ret(MXNET_LAPACK_##fname(MXNET_LAPACK_COL_MAJOR, A.size(1), A.size(0), \
+                               A.dptr_, A.stride_, pivot.dptr_)); \
+  CHECK_GE(ret, 0) << #fname << " failed in lapack on cpu."; \
+  if (check_singular) { \
+    CHECK_EQ(ret, 0) << "the input matrix is non-convertible"; \
+  } \
+}
+
+LINALG_CPU_GETRF(sgetrf, float)
+LINALG_CPU_GETRF(dgetrf, double)
+
+
+#define LINALG_CPU_BATCH_GETRF(fname, DType, IndexT) \
+template<> inline \
+void linalg_batch_getrf<cpu, DType>(const Tensor<cpu, 3, DType>& A, \
+                                    const Tensor<cpu, 2, IndexT>& pivot, \
+                                    bool check_singular, \
+                                    Stream<cpu> *s) { \
+  for (IndexT i = 0; i < A.size(0); ++i) { \
+    linalg_getrf(A[i], pivot[i], check_singular); \
+  } \
+}
+
+LINALG_CPU_BATCH_GETRF(sgetrf, float, LapackIndex<cpu>::IndexT)
+LINALG_CPU_BATCH_GETRF(dgetrf, double, LapackIndex<cpu>::IndexT)
+
+#ifdef __CUDACC__
+
+// "getrfBatched" and "getriBatched" in cuBLAS must have DType *matrices[] as input
+// to store the pointers of each batch matrix. This kernel is used to build the
+// pointer array.
+struct set_matrix {
+  template<typename DType>
+  MSHADOW_XINLINE static void Map(int i, DType **p, DType *m, int step) {
+    p[i] = m + i * step;
+  }
+};
+
+// GETRF only available with cuda8 or higher.
+#if CUDA_VERSION >= 8000
+
+// Since there is no "getri" in cuSolver, we are using batched version of
+// "getrf" and "getri" in cuBLAS here. These routines are good for large
+// batches of small matrices, so performance issue may happen when computing
+// large matices. We leave it here until MAGMA which has "getri" is introduced
+// into MXNet.
+#define LINALG_GPU_BATCH_GETRF(fname, DType) \
+template<> inline \
+void linalg_batch_getrf<gpu, DType>(const Tensor<gpu, 3, DType>& A, \
+                                    const Tensor<gpu, 2, int>& pivot, \
+                                    bool check_singular, \
+                                    Stream<gpu> *s) { \
+  using namespace mxnet; \
+  using namespace mxnet::op::mxnet_op; \
+  CHECK_NOTNULL(s); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_getrf, info, int, A.size(0)); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_getrf, A_ptr_buf, \
+      DType *, A.size(0)); \
+  DType **A_ptr = static_cast<DType **>(A_ptr_buf.dptr); \
+  Kernel<set_matrix, gpu>::Launch(s, A.size(0), \
+                                  A_ptr, A.dptr_, \
+                                  A.size(1) * A.size(2)); \
+  CUBLAS_CALL(cublas##fname(Stream<gpu>::GetBlasHandle(s), \
+                            A.size(1), A_ptr, A.size(2), pivot.dptr_, \
+                            static_cast<int *>(info.dptr), A.size(0))) \
+  Storage::Get()->Free(info); \
+  Storage::Get()->Free(A_ptr_buf); \
+}
+
+#else
+
+#define LINALG_GPU_BATCH_GETRF(fname, DType) \
+template<> inline \
+void linalg_batch_getrf<gpu, DType>(const Tensor<gpu, 3, DType>& A, \
+                                    const Tensor<gpu, 2, int>& pivot, \
+                                    bool check_singular, \
+                                    Stream<gpu> *s) { \
+  LOG(FATAL) << "batched getrf requires CUDA version >= 8.0!"; \
+}
+
+#endif  // CUDA_VERSION >= 8000
+
+LINALG_GPU_BATCH_GETRF(SgetrfBatched, float)
+LINALG_GPU_BATCH_GETRF(DgetrfBatched, double)
+
+#endif  // __CUDACC__
+
+//////////////////////////////// GETRI ////////////////////////////////////////////
+
+// CPU/GPU-versions of LAPACK function "getri"
+
+// The input of this function should be col-major for performance.
+#define LINALG_CPU_GETRI(fname, DType) \
+template<> inline \
+void linalg_getri<cpu, DType>(const Tensor<cpu, 2, DType>& LU, \
+                              const Tensor<cpu, 1, lapack_index_t>& pivot, \
+                              const Tensor<cpu, 1, DType>& work, \
+                              Stream<cpu> *s) { \
+  int ret(MXNET_LAPACK_##fname(MXNET_LAPACK_COL_MAJOR, LU.size(0), LU.dptr_, \
+                               LU.stride_, pivot.dptr_, work.dptr_, work.size(0))); \
+  CHECK_EQ(ret, 0) << #fname << " failed in lapack on cpu."; \
+}
+LINALG_CPU_GETRI(sgetri, float)
+LINALG_CPU_GETRI(dgetri, double)
+
+template<typename xpu, typename DType>
+lapack_index_t linalg_getri_workspace_query(const Tensor<xpu, 2, DType>& A, \
+                                 Stream<cpu> *s) {
+  LOG(FATAL) << "it only takes float or double Tensor";
+  return 0;
+}
+
+// Query workspace for "getri"
+#define LINALG_CPU_GETRI_WORKSPACE_QUERY(func, DType) \
+template<> inline \
+lapack_index_t linalg_getri_workspace_query<cpu, DType>(const Tensor<cpu, 2, DType>& A, \
+                                             Stream<cpu> *s) { \
+  DType lwork(0); \
+  MXNET_LAPACK_##func(MXNET_LAPACK_COL_MAJOR, A.size(0), A.dptr_, \
+                      A.stride_, nullptr, &lwork, -1); \
+  return static_cast<lapack_index_t>(lwork); \
+}
+
+LINALG_CPU_GETRI_WORKSPACE_QUERY(sgetri, float)
+LINALG_CPU_GETRI_WORKSPACE_QUERY(dgetri, double)
+
+#ifdef __CUDACC__
+
+// GETRI only available with cuda8 or higher.
+#if CUDA_VERSION >= 8000
+
+// Since there is no "getri" in cuSolver, we are using batched version of
+// "getrf" and "getri" in cuBLAS here. These routines are good for large
+// batches of small matrices, so performance issue may happen when computing
+// large matices. We leave it here until MAGMA which has "getri" is introduced
+// into MXNet.
+#define LINALG_GPU_BATCH_GETRI(fname, DType) \
+template<> inline \
+void linalg_batch_getri<gpu, DType>(const Tensor<gpu, 3, DType>& A, \
+                                    const Tensor<gpu, 3, DType>& LU, \
+                                    const Tensor<gpu, 2, int>& pivot, \
+                                    Stream<gpu> *s) { \
+  using namespace mxnet; \
+  using namespace mxnet::op::mxnet_op; \
+  CHECK_NOTNULL(s); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_getri, info, int, A.size(0)); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_getri, \
+      A_ptr_buf, DType *, A.size(0)); \
+  DType **A_ptr = static_cast<DType **>(A_ptr_buf.dptr); \
+  EPHEMERAL_GPU_STORAGE_ALLOC(linalg_batch_getri, \
+      LU_ptr_buf, DType *, A.size(0)); \
+  DType **LU_ptr = static_cast<DType **>(LU_ptr_buf.dptr); \
+  Kernel<set_matrix, gpu>::Launch(s, A.size(0), \
+                                  A_ptr, A.dptr_, \
+                                  A.size(1) * A.size(2)); \
+  Kernel<set_matrix, gpu>::Launch(s, LU.size(0), \
+                                  LU_ptr, LU.dptr_, \
+                                  LU.size(1) * LU.size(2)); \
+  CUBLAS_CALL(cublas##fname(Stream<gpu>::GetBlasHandle(s), A.size(1), \
+                            const_cast<const DType **>(LU_ptr), LU.size(2), \
+                            const_cast<const int *>(pivot.dptr_), A_ptr, A.size(2), \
+                            static_cast<int *>(info.dptr), A.size(0))) \
+  Storage::Get()->Free(info); \
+  Storage::Get()->Free(A_ptr_buf); \
+  Storage::Get()->Free(LU_ptr_buf); \
+}
+
+#else
+
+#define LINALG_GPU_BATCH_GETRI(fname, DType) \
+template<> inline \
+void linalg_batch_getri<gpu, DType>(const Tensor<gpu, 3, DType>& A, \
+                                    const Tensor<gpu, 3, DType>& LU, \
+                                    const Tensor<gpu, 2, int>& pivot, \
+                                    Stream<gpu> *s) { \
+  LOG(FATAL) << "batched getri requires CUDA version >= 8.0!"; \
+}
+
+#endif  // CUDA_VERSION >= 8000
+
+LINALG_GPU_BATCH_GETRI(SgetriBatched, float)
+LINALG_GPU_BATCH_GETRI(DgetriBatched, double)
+
+#endif  // __CUDACC__
+
+//////////////////////////////// INVERSE ////////////////////////////////////////////
+
+// CPU/GPU-versions of matrix inverse combining LAPACK function "getrf" and "getri"
+
+// Note A = inverse(B)
+#define LINALG_CPU_BATCH_INVERSE(xpu, DType) \
+template<> inline \
+void linalg_batch_inverse<xpu, DType>(const Tensor<xpu, 3, DType>& A, \
+                                      const Tensor<xpu, 3, DType>& B, \
+                                      const mxnet::OpContext& ctx) { \
+  Stream<xpu> *s = ctx.get_stream<xpu>(); \
+  lapack_index_t lwork(linalg_getri_workspace_query(A[0], s)); \
+  lapack_index_t workspace_size = (sizeof(lapack_index_t) * A.size(1) + sizeof(DType) * lwork + \
+    sizeof(DType) - 1) / sizeof(DType); \
+  Tensor<xpu, 1, DType> workspace = ctx.requested[0].\
+    get_space_typed<xpu, 1, DType>(Shape1(workspace_size), s); \
+  const Tensor<xpu, 1, lapack_index_t> pivot(reinterpret_cast<lapack_index_t *>(workspace.dptr_), \
+                                  Shape1(A.size(1))); \
+  const Tensor<xpu, 1, DType> work(reinterpret_cast<DType *>(pivot.dptr_ + pivot.MSize()), \
+                                   Shape1(lwork)); \
+  if (A.dptr_ != B.dptr_) Copy(A, B, s); \
+  for (lapack_index_t i = 0; i < A.size(0); ++i) { \
+    linalg_getrf(A[i], pivot, true, s); \
+    linalg_getri(A[i], pivot, work, s); \
+  } \
+}
+LINALG_CPU_BATCH_INVERSE(cpu, float)
+LINALG_CPU_BATCH_INVERSE(cpu, double)
+
+
+#ifdef __CUDACC__
+
+// GETRF and GETRI only available with cuda8 or higher.
+#if CUDA_VERSION >= 8000
+
+#define LINALG_GPU_BATCH_INVERSE(xpu, DType) \
+template<> inline \
+void linalg_batch_inverse<xpu, DType>(const Tensor<xpu, 3, DType>& A, \
+                                      const Tensor<xpu, 3, DType>& B, \
+                                      const mxnet::OpContext& ctx) { \
+  Stream<xpu> *s = ctx.get_stream<xpu>(); \
+  int pivot_size = sizeof(int) * A.size(0) * A.size(1); \
+  int matrix_size = sizeof(DType) * A.shape_.Size(); \
+  int workspace_size = (pivot_size + matrix_size + \
+    sizeof(DType) - 1) / sizeof(DType); \
+  Tensor<xpu, 1, DType> workspace = ctx.requested[0].\
+    get_space_typed<xpu, 1, DType>(Shape1(workspace_size), s); \
+  const Tensor<xpu, 2, int> pivot(reinterpret_cast<int *>(workspace.dptr_), \
+                                  Shape2(A.size(0), A.size(1))); \
+  int offset = pivot.MSize() & 1 ? pivot.MSize() + 1 : pivot.MSize(); \
+  const Tensor<xpu, 3, DType> LU(reinterpret_cast<DType *>(pivot.dptr_ + offset), \
+                                 A.shape_); \
+  Copy(LU, B, s); \
+  linalg_batch_getrf(LU, pivot, true, s); \
+  linalg_batch_getri(A, LU, pivot, s); \
+}
+
+#else
+
+#define LINALG_GPU_BATCH_INVERSE(xpu, DType) \
+template<> inline \
+void linalg_batch_inverse<xpu, DType>(const Tensor<xpu, 3, DType>& A, \
+                                      const Tensor<xpu, 3, DType>& B, \
+                                      const mxnet::OpContext& ctx) { \
+  LOG(FATAL) << "gpu matrix inverse requires CUDA version >= 8.0!"; \
+}
+
+#endif  // CUDA_VERSION >= 8000
+
+LINALG_GPU_BATCH_INVERSE(gpu, float)
+LINALG_GPU_BATCH_INVERSE(gpu, double)
+
+#endif  // __CUDACC__
+
+//////////////////////////////// DET ////////////////////////////////////////////
+
+// CPU/GPU-versions of helper functions used in matrix determinant operators
+
+#define LINALG_CPU_BATCH_DET_HELPER(xpu, DType, IndexT) \
+template<> inline \
+void linalg_batch_det_backward_helper<xpu, DType>(const Tensor<xpu, 3, DType>& LU, \
+                                         const Tensor<xpu, 2, IndexT>& pivot, \
+                                         const Tensor<xpu, 1, DType>& det, \
+                                         const Tensor<xpu, 3, DType>& temp, \
+                                         const DType zero_det, \
+                                         const mxnet::OpContext& ctx) { \
+  Stream<xpu> *s = ctx.get_stream<xpu>(); \
+  lapack_index_t lwork(linalg_getri_workspace_query(LU[0], s)); \
+  Tensor<xpu, 1, DType> work = ctx.requested[0].\
+    get_space_typed<xpu, 1, DType>(Shape1(lwork), s); \
+  for (index_t i = 0; i < LU.size(0); ++i) { \
+    if (det[i] != zero_det) { \
+      linalg_getri(LU[i], pivot[i], work, s); \
+    } \
+  } \
+}
+
+LINALG_CPU_BATCH_DET_HELPER(cpu, float, LapackIndex<cpu>::IndexT)
+LINALG_CPU_BATCH_DET_HELPER(cpu, double, LapackIndex<cpu>::IndexT)
+
+// GETRF and GETRI only available with cuda8 or higher.
+#if CUDA_VERSION >= 8000
+
+#define LINALG_GPU_BATCH_DET_HELPER(xpu, DType) \
+template<> inline \
+void linalg_batch_det_backward_helper<xpu, DType>(const Tensor<xpu, 3, DType>& LU, \
+                                         const Tensor<xpu, 2, int>& pivot, \
+                                         const Tensor<xpu, 1, DType>& det, \
+                                         const Tensor<xpu, 3, DType>& temp, \
+                                         const DType zero_det, \
+                                         const mxnet::OpContext& ctx) { \
+  Stream<xpu> *s = ctx.get_stream<xpu>(); \
+  linalg_batch_getri(temp, LU, pivot, s); \
+  Copy(LU, temp, s); \
+}
+
+#else
+
+#define LINALG_GPU_BATCH_DET_HELPER(xpu, DType) \
+template<> inline \
+void linalg_batch_det_backward_helper<xpu, DType>(const Tensor<xpu, 3, DType>& LU, \
+                                         const Tensor<xpu, 2, int>& pivot, \
+                                         const Tensor<xpu, 1, DType>& det, \
+                                         const Tensor<xpu, 3, DType>& temp, \
+                                         const DType zero_det, \
+                                         const mxnet::OpContext& ctx) { \
+  LOG(FATAL) << "gpu matrix inverse requires CUDA version >= 8.0!"; \
+}
+
+#endif  // CUDA_VERSION >= 8000
+
+LINALG_GPU_BATCH_DET_HELPER(gpu, float)
+LINALG_GPU_BATCH_DET_HELPER(gpu, double)
 
 #endif  // MXNET_OPERATOR_LINALG_IMPL_H_

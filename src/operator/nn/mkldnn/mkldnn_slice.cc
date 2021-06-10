@@ -23,7 +23,7 @@
  * \author Zhiyuan Huang
 */
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 
 #include "./mkldnn_ops-inl.h"
 #include "./mkldnn_base-inl.h"
@@ -37,25 +37,27 @@ MKLDNNSliceFwd::MKLDNNSliceFwd(const SliceParam &param,
                                const NDArray &out) {
   const mxnet::TShape ishape = in.shape();
   const mxnet::TShape oshape = out.shape();
-  uint32_t N = ishape.ndim();
+  const int N = ishape.ndim();
   mkldnn::memory::dims dims(N);
   mkldnn::memory::dims offsets(N);
-  for (uint32_t i = 0; i < N; ++i) {
-    int s = 0;
-    if (param.begin[i]) {
+  for (int i = 0; i < N; ++i) {
+    dim_t s = 0;
+    if (i < param.begin.ndim() &&  param.begin[i]) {
       s = *param.begin[i];
       if (s < 0) s += ishape[i];
     }
     dims[i] = oshape[i];
     offsets[i] = s;
   }
-  auto in_mem_pd = in.GetMKLDNNData()->get_primitive_desc();
-  auto out_mem_pd = out.GetMKLDNNData()->get_primitive_desc();
-  auto view_pd = mkldnn::view::primitive_desc(in_mem_pd, dims, offsets);
-  auto reorder_pd = reorder::primitive_desc(view_pd.dst_primitive_desc(), out_mem_pd);
-  this->data_ = std::make_shared<mkldnn::memory>(view_pd.dst_primitive_desc(), nullptr);
-  this->out_ = std::make_shared<mkldnn::memory>(view_pd.dst_primitive_desc(), nullptr);
-  this->fwd_ = std::make_shared<mkldnn::reorder>(reorder_pd, *this->data_, *this->out_);
+
+  auto in_md = in.GetMKLDNNData()->get_desc();
+  auto out_md = out.GetMKLDNNData()->get_desc();
+  auto sub_md = in_md.submemory_desc(dims, offsets);
+
+  auto engine = CpuEngine::Get()->get_engine();
+  this->data_ = std::make_shared<mkldnn::memory>(sub_md, engine, nullptr);
+  this->out_ = std::make_shared<mkldnn::memory>(out_md, engine, nullptr);
+  this->fwd_ = std::make_shared<mkldnn::reorder>(*this->data_, *this->out_);
 }
 
 void MKLDNNSliceFwd::SetNewMem(const mkldnn::memory &input, const mkldnn::memory &output) {
@@ -63,8 +65,9 @@ void MKLDNNSliceFwd::SetNewMem(const mkldnn::memory &input, const mkldnn::memory
   this->out_->set_data_handle(output.get_data_handle());
 }
 
-const mkldnn::reorder &MKLDNNSliceFwd::GetPd() const {
-  return *fwd_;
+void MKLDNNSliceFwd::Register() {
+  MKLDNNStream::Get()->RegisterPrimArgs(*fwd_,
+      {{MKLDNN_ARG_FROM, *(this->data_)}, {MKLDNN_ARG_TO, *(this->out_)}});
 }
 
 MKLDNNSliceFwd &GetSliceForward(const SliceParam &param, const bool is_train,
@@ -87,18 +90,19 @@ MKLDNNSliceFwd &GetSliceForward(const SliceParam &param, const bool is_train,
   return it->second;
 }
 
-void MKLDNNSlice(const SliceParam &param, const OpContext& ctx,
+void MKLDNNSlice(const nnvm::NodeAttrs& attrs, const OpContext& ctx,
                  const NDArray &in, OpReqType req, const NDArray &out) {
+  const SliceParam& param = nnvm::get<SliceParam>(attrs.parsed);
   MKLDNNSliceFwd &fwd = GetSliceForward(param, ctx.is_train, in, out);
   auto in_mem = in.GetMKLDNNData();
-  auto out_mem_pd = out.GetMKLDNNData()->get_primitive_desc();
-  auto out_mem = CreateMKLDNNMem(out, out_mem_pd, req);
+  auto out_md = out.GetMKLDNNData()->get_desc();
+  auto out_mem = CreateMKLDNNMem(out, out_md, req);
   fwd.SetNewMem(*in_mem, *out_mem.second);
-  MKLDNNStream::Get()->RegisterPrim(fwd.GetPd());
+  fwd.Register();
   CommitOutput(out, out_mem);
   MKLDNNStream::Get()->Submit();
 }
 
 }  // namespace op
 }  // namespace mxnet
-#endif  // MXNET_USE_MKLDNN == 1
+#endif  // MXNET_USE_ONEDNN == 1

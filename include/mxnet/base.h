@@ -39,18 +39,6 @@
 
 
 /*!
- * \brief define compatible keywords in g++
- *  Used to support g++-4.6 and g++4.7
- */
-#if DMLC_USE_CXX11 && defined(__GNUC__) && !defined(__clang_version__)
-#if __GNUC__ == 4 && __GNUC_MINOR__ < 8
-#error "Currently we need g++ 4.8 or higher to fully support c++11 features"
-#define override
-#define final
-#endif
-#endif
-
-/*!
  * \brief define dllexport for Visual Studio
  */
 #ifdef _MSC_VER
@@ -71,9 +59,9 @@
 #endif
 
 /*! \brief major version */
-#define MXNET_MAJOR 1
+#define MXNET_MAJOR 2
 /*! \brief minor version */
-#define MXNET_MINOR 5
+#define MXNET_MINOR 0
 /*! \brief patch version */
 #define MXNET_PATCH 0
 /*! \brief mxnet version */
@@ -93,6 +81,8 @@ typedef mshadow::cpu cpu;
 typedef mshadow::gpu gpu;
 /*! \brief index type usually use unsigned */
 typedef mshadow::index_t index_t;
+/*! \brief index type for blas library.*/
+typedef mshadow::lapack_index_t lapack_index_t;
 /*! \brief data type that will be used to store ndarray */
 typedef mshadow::default_real_t real_t;
 /*! \brief operator structure from NNVM */
@@ -192,6 +182,11 @@ struct Context {
    */
   inline static int32_t GetGPUCount();
   /*!
+   * Is the cuda driver installed and visible to the system.
+   * \return Whether the driver is present.
+   */
+  inline static bool GPUDriverPresent();
+  /*!
    * Get the number of streams that a GPU Worker has available to operations.
    * \return The number of streams that are available.
    */
@@ -222,6 +217,14 @@ struct Context {
    * \return Context
    */
   inline static Context FromString(const std::string& str);
+
+ private:
+#if MXNET_USE_CUDA
+    static void CudaLibChecks();
+#endif
+#if MXNET_USE_CUDNN
+    static void CuDNNLibChecks();
+#endif
 };
 
 #if MXNET_USE_CUDA
@@ -338,11 +341,11 @@ struct RunContext {
   /*! \brief base Context */
   Context ctx;
   /*!
-   * \brief the stream of the device, can be NULL or Stream<gpu>* in GPU mode
+   * \brief the stream of the device, can be nullptr or Stream<gpu>* in GPU mode
    */
   void *stream;
   /*!
-   * \brief the auxiliary stream of the device, can be NULL or Stream<gpu>* in GPU mode
+   * \brief the auxiliary stream of the device, can be nullptr or Stream<gpu>* in GPU mode
    */
   void *aux_stream;
   /*!
@@ -387,17 +390,21 @@ inline bool Context::operator<(const Context &b) const {
 inline Context Context::Create(DeviceType dev_type, int32_t dev_id) {
   Context ctx;
   ctx.dev_type = dev_type;
-  if (dev_id < 0) {
-    ctx.dev_id = 0;
-    if (dev_type & kGPU) {
+  ctx.dev_id = dev_id < 0 ? 0 : dev_id;
+  if (dev_type & kGPU) {
+#if MXNET_USE_CUDA
+    CudaLibChecks();
+#endif
+#if MXNET_USE_CUDNN
+    CuDNNLibChecks();
+#endif
+    if (dev_id < 0) {
 #if MXNET_USE_CUDA
       CHECK_EQ(cudaGetDevice(&ctx.dev_id), cudaSuccess);
 #else
       LOG(FATAL) << "Please compile with CUDA enabled for cuda features";
 #endif
     }
-  } else {
-    ctx.dev_id = dev_id;
   }
   return ctx;
 }
@@ -417,11 +424,26 @@ inline Context Context::GPU(int32_t dev_id) {
   return Create(kGPU, dev_id);
 }
 
+inline bool Context::GPUDriverPresent() {
+#if MXNET_USE_CUDA
+  int cuda_driver_version = 0;
+  CHECK_EQ(cudaDriverGetVersion(&cuda_driver_version), cudaSuccess);
+  return cuda_driver_version > 0;
+#else
+  return false;
+#endif
+}
+
 inline int32_t Context::GetGPUCount() {
 #if MXNET_USE_CUDA
+  if (!GPUDriverPresent()) {
+    return 0;
+  }
   int32_t count;
   cudaError_t e = cudaGetDeviceCount(&count);
-  if (e == cudaErrorNoDevice) {
+  // TODO(junwu): Remove e == cudaErrorInsufficientDriver
+  // This is skipped for working around wheel build system with older CUDA driver.
+  if (e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver) {
     return 0;
   }
   CHECK_EQ(e, cudaSuccess) << " CUDA: " << cudaGetErrorString(e);
@@ -519,7 +541,7 @@ inline std::ostream& operator<<(std::ostream &out, const Context &ctx) {
 #define ADD_FILELINE "\n\nDefined in " __FILE__ ":L" STRINGIZE(__LINE__)
 
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1 || MXNET_USE_INTGEMM == 1
 constexpr size_t kMKLDNNAlign = 64;
 #endif
 

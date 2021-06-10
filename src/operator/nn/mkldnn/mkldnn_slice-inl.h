@@ -26,7 +26,7 @@
 #ifndef MXNET_OPERATOR_NN_MKLDNN_MKLDNN_SLICE_INL_H_
 #define MXNET_OPERATOR_NN_MKLDNN_MKLDNN_SLICE_INL_H_
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 
 #include <dmlc/logging.h>
 #include <dmlc/parameter.h>
@@ -45,7 +45,7 @@ class MKLDNNSliceFwd {
                  const NDArray &in,
                  const NDArray &out);
   void SetNewMem(const mkldnn::memory &input, const mkldnn::memory &output);
-  const mkldnn::reorder &GetPd() const;
+  void Register();
 
  private:
   std::shared_ptr<mkldnn::memory> data_;
@@ -57,10 +57,10 @@ typedef ParamOpSign<SliceParam> MKLDNNSliceSignature;
 MKLDNNSliceFwd &GetSliceForward(const SliceParam &param, const bool is_train,
                  const NDArray &in_data, const NDArray &out_data);
 
-void MKLDNNSlice(const SliceParam &param, const OpContext& ctx,
+void MKLDNNSlice(const nnvm::NodeAttrs& attrs, const OpContext& ctx,
                  const NDArray &in, OpReqType req, const NDArray &out);
 
 }  // namespace op
 }  // namespace mxnet
-#endif  // MXNET_USE_MKLDNN == 1
+#endif  // MXNET_USE_ONEDNN == 1
 #endif  // MXNET_OPERATOR_NN_MKLDNN_MKLDNN_SLICE_INL_H_

@@ -28,8 +28,11 @@
 #include <dmlc/logging.h>
 #include <dmlc/omp.h>
 #include <nnvm/graph.h>
+#include <nnvm/node.h>
+#include <mxnet/imperative.h>
 #include <mxnet/engine.h>
 #include <mxnet/ndarray.h>
+#include <mxnet/storage.h>
 #include <mxnet/op_attr_types.h>
 #include <mxnet/graph_attr_types.h>
 #include <nnvm/graph_attr_types.h>
@@ -46,13 +49,25 @@
 #include <limits>
 
 #include "../operator/mxnet_op.h"
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
 #include "../operator/nn/mkldnn/mkldnn_base-inl.h"
 #endif
+
+#if defined(_WIN32) || defined(_WIN64) || defined(__WINDOWS__)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 
 namespace mxnet {
 namespace common {
 
+#if defined(_WIN32) || defined(_WIN64) || defined(__WINDOWS__)
+inline size_t current_process_id() { return ::GetCurrentProcessId(); }
+#else
+inline size_t current_process_id() { return getpid(); }
+#endif
 /*!
  * \brief IndPtr should be non-negative, in non-decreasing order, start with 0
  *           and end with value equal with size of indices.
@@ -398,6 +413,15 @@ inline std::string dev_type_string(const int dev_type) {
   return "unknown";
 }
 
+inline std::string attr_value_string(const nnvm::NodeAttrs& attrs,
+                                     const std::string& attr_name,
+                                     std::string default_val = "") {
+  if (attrs.dict.find(attr_name) == attrs.dict.end()) {
+    return default_val;
+  }
+  return attrs.dict.at(attr_name);
+}
+
 /*! \brief get string representation of the operator stypes */
 inline std::string operator_stype_string(const nnvm::NodeAttrs& attrs,
                                          const int dev_mask,
@@ -426,10 +450,10 @@ inline std::string operator_stype_string(const nnvm::NodeAttrs& attrs,
 
 /*! \brief get string representation of the operator */
 inline std::string operator_string(const nnvm::NodeAttrs& attrs,
-                                  const OpContext& ctx,
-                                  const std::vector<NDArray>& inputs,
-                                  const std::vector<OpReqType>& req,
-                                  const std::vector<NDArray>& outputs) {
+                                   const OpContext& ctx,
+                                   const std::vector<NDArray>& inputs,
+                                   const std::vector<OpReqType>& req,
+                                   const std::vector<NDArray>& outputs) {
   std::string result = "";
   std::vector<int> in_stypes;
   std::vector<int> out_stypes;
@@ -471,10 +495,10 @@ inline void LogStorageFallback(const nnvm::NodeAttrs& attrs,
     "0 to suppress this warning.";
   os << "\nStorage type fallback detected:\n" << op_str << warning;
   LogOnce(os.str());
-#if MXNET_USE_MKLDNN == 1
-  if (!MKLDNNEnvSet()) common::LogOnce("MXNET_MKLDNN_ENABLED flag is off. "
-                                       "You can re-enable by setting MXNET_MKLDNN_ENABLED=1");
-  if (GetMKLDNNCacheSize() != -1) common::LogOnce("MXNET_MKLDNN_CACHE_NUM is set."
+#if MXNET_USE_ONEDNN == 1
+  if (!MKLDNNEnvSet()) common::LogOnce("MXNET_ONEDNN_ENABLED flag is off. "
+                                       "You can re-enable by setting MXNET_ONEDNN_ENABLED=1");
+  if (GetMKLDNNCacheSize() != -1) common::LogOnce("MXNET_ONEDNN_CACHE_NUM is set."
                                        "Should only be set if "
                                        "your model has variable input shapes, "
                                        "as cache size may grow unbounded");
@@ -654,7 +678,7 @@ FCompType GetFCompute(const nnvm::Op* op, const std::string& name,
   } else if (ctx.dev_mask() == gpu::kDevMask) {
     return fcompute_gpu.get(op, nullptr);
   } else {
-    LOG(FATAL) << "Unknown device mask";
+    LOG(FATAL) << "Unknown device mask " << ctx.dev_mask();
     return nullptr;
   }
 }
@@ -672,6 +696,11 @@ constexpr size_t MaxIntegerValue() {
 template <>
 constexpr size_t MaxIntegerValue<mshadow::half::half_t>() {
   return size_t(2) << 10;
+}
+
+template <>
+constexpr size_t MaxIntegerValue<mshadow::bfloat::bf16_t>() {
+  return size_t(2) << 14;
 }
 
 MSHADOW_XINLINE int ilog2ul(size_t a) {
@@ -704,8 +733,10 @@ inline NDArray InitZeros(const NDArrayStorageType stype, const mxnet::TShape &sh
 /*!
  * \brief Helper to add a NDArray of zeros to a std::vector.
  */
-inline void EmplaceBackZeros(const NDArrayStorageType stype, const mxnet::TShape &shape,
-                             const Context &ctx, const int dtype,
+inline void EmplaceBackZeros(const NDArrayStorageType stype,
+                             const mxnet::TShape &shape,
+                             const Context &ctx,
+                             const int dtype,
                              std::vector<NDArray> *vec) {
   // NDArray with default storage
   if (stype == kDefaultStorage) {
@@ -723,15 +754,248 @@ inline void EmplaceBackZeros(const NDArrayStorageType stype, const mxnet::TShape
  */
 template<typename DType>
 inline void ParallelCopy(DType* dst, const DType* src, index_t size) {
-  static index_t copy_block_size = dmlc::GetEnv("MXNET_CPU_PARALLEL_COPY_SIZE", 200000);
+  static index_t copy_block_size = dmlc::GetEnv("MXNET_CPU_PARALLEL_SIZE", 200000);
   if (size >= copy_block_size) {
     #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
     for (index_t i = 0; i < size; ++i) {
       dst[i] = src[i];
     }
   } else {
+#pragma GCC diagnostic push
+#if __GNUC__ >= 8
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
     std::memcpy(dst, src, sizeof(DType) * size);
+#pragma GCC diagnostic pop
   }
+}
+
+/*!
+ * \breif parallelize add by OpenMP
+ */
+template<typename DType>
+inline void ParallelAdd(DType* dst, const DType* src, index_t size) {
+  static index_t add_block_size = dmlc::GetEnv("MXNET_CPU_PARALLEL_SIZE", 200000);
+  if (size >= add_block_size) {
+    #pragma omp parallel for num_threads(engine::OpenMP::Get()->GetRecommendedOMPThreadCount())
+    for (index_t i = 0; i < size; ++i) {
+      dst[i] += src[i];
+    }
+  } else {
+    for (index_t i = 0; i < size; ++i) {
+      dst[i] += src[i];
+    }
+  }
+}
+
+/*!
+ * \brief If numpy compatibility is turned off (default), the shapes passed in
+ * by users follow the legacy shape definition:
+ * 1. 0 ndim means the shape is completely unknown.
+ * 2. 0 dim size means the dim size is unknown.
+ * We need to convert those shapes to use the numpy shape definition:
+ * 1. 0 ndim means it's a scalar tensor.
+ * 2. -1 ndim means the shape is unknown.
+ * 3. 0 dim size means no elements in that dimension.
+ * 4. -1 dim size means the dimension's size is unknown.
+ * so that operator's infer shape function can work in backend.
+ * \param shape to be converted.
+ * Note: It is possible that the shape to be converted is already
+ * numpy compatible. For example, when a subgraph operator's infer
+ * shape function is called from the infer shape pass of the whole
+ * graph, its input/output shapes have been converted to numpy
+ * compatible shapes.
+ */
+inline void ConvertToNumpyShape(mxnet::TShape* shape) {
+  if (shape->ndim() == 0) {  // legacy shape ndim = 0 means unknown
+    *shape = mxnet::TShape();  // unknown shape ndim = -1
+  } else {
+    for (int j = 0; j < shape->ndim(); ++j) {
+      if ((*shape)[j] == 0) {  // legacy shape dim_size = 0 means unknown
+        (*shape)[j] = -1;  // unknown dim size = -1
+      }
+    }
+  }
+}
+
+inline void ConvertToNumpyShape(mxnet::ShapeVector* shapes) {
+  for (size_t i = 0; i < shapes->size(); ++i) {
+    ConvertToNumpyShape(&(shapes->at(i)));
+  }
+}
+
+/*!
+ * \brief This is function is used to convert shapes returned by
+ * the infer shape functions/pass to the legacy shape definition.
+ */
+inline void ConvertToLegacyShape(mxnet::TShape* shape) {
+  if (!mxnet::ndim_is_known(*shape)) {
+    *shape = mxnet::TShape(0, -1);
+  } else {
+    for (int j = 0; j < shape->ndim(); ++j) {
+      if (!mxnet::dim_size_is_known(*shape, j)) {
+        (*shape)[j] = 0;
+      }
+    }
+  }
+}
+
+inline void ConvertToLegacyShape(mxnet::ShapeVector* shapes) {
+  for (size_t i = 0; i < shapes->size(); ++i) {
+    ConvertToLegacyShape(&(shapes->at(i)));
+  }
+}
+void ExecuteMonInputCallback(
+    const nnvm::IndexedGraph &idx, const std::vector<NDArray *> &state_arrays,
+    size_t nid, const std::function<void(const char *, const char *, void *)>
+                    &monitor_callback);
+
+void ExecuteMonOutputCallback(
+    const nnvm::IndexedGraph &idx, const std::vector<NDArray *> &state_arrays,
+    size_t nid, const std::function<void(const char *, const char *, void *)>
+                    &monitor_callback);
+
+inline mxnet::TShape CanonicalizeAxes(const mxnet::TShape& src) {
+  // convert negative axes to positive values
+  const int ndim = src.ndim();
+  mxnet::TShape axes = src;
+  for (int i = 0; i < ndim; ++i) {
+    if (axes[i] < 0) {
+      axes[i] += ndim;
+    }
+    CHECK(axes[i] >= 0 && axes[i] < ndim) << "axes[" << i << "]="
+                                          << axes[i] << " exceeds the range ["
+                                          << 0 << ", " << ndim << ")";
+  }
+  return axes;
+}
+
+inline bool is_float(const int dtype) {
+  return dtype == mshadow::kFloat32 || dtype == mshadow::kFloat64 || dtype == mshadow::kFloat16;
+}
+
+inline bool is_int(const int dtype) {
+  return dtype == mshadow::kUint8 || dtype == mshadow::kInt8 ||
+         dtype == mshadow::kInt32 || dtype == mshadow::kInt64;
+}
+
+inline int get_more_precise_type(const int type1, const int type2) {
+  if (type1 == type2) return type1;
+  if (is_float(type1) && is_float(type2)) {
+    if (type1 == mshadow::kFloat64 || type2 == mshadow::kFloat64) {
+      return mshadow::kFloat64;
+    }
+    if (type1 == mshadow::kFloat32 || type2 == mshadow::kFloat32) {
+      return mshadow::kFloat32;
+    }
+    return mshadow::kFloat16;
+  } else if (is_float(type1) || is_float(type2)) {
+    return is_float(type1) ? type1 : type2;
+  }
+  if (type1 == mshadow::kInt64 || type2 == mshadow::kInt64) {
+    return mshadow::kInt64;
+  }
+  if (type1 == mshadow::kInt32 || type2 == mshadow::kInt32) {
+    return mshadow::kInt32;
+  }
+  CHECK(!((type1 == mshadow::kUint8 && type2 == mshadow::kInt8) ||
+          (type1 == mshadow::kInt8 && type2 == mshadow::kUint8)))
+    << "1 is UInt8 and 1 is Int8 should not get here";
+  if (type1 == mshadow::kUint8 || type2 == mshadow::kUint8) {
+    return mshadow::kUint8;
+  }
+  return mshadow::kInt8;
+}
+
+inline int np_binary_out_infer_type(const int type1, const int type2) {
+  if ((type1 == mshadow::kUint8 && type2 == mshadow::kInt8) ||
+      (type1 == mshadow::kInt8 && type2 == mshadow::kUint8)) {
+    return mshadow::kInt32;
+  }
+  return get_more_precise_type(type1, type2);
+}
+
+inline const std::string
+NodeAttrsGetProfilerScope(const nnvm::NodeAttrs& attrs) {
+  // obtain the profiler scope name, if assigned previously
+  std::string profiler_scope = MXNET_STORAGE_DEFAULT_PROFILER_SCOPE_CSTR;
+  const std::unordered_map<std::string, std::string>& node_attrs_dict = attrs.dict;
+  const std::unordered_map<std::string, std::string>::const_iterator
+      profiler_scope_iter  = node_attrs_dict.find("__profiler_scope__");
+  if (profiler_scope_iter != node_attrs_dict.end()) {
+    profiler_scope = profiler_scope_iter->second;
+  }
+  return profiler_scope;
+}
+
+inline int GetDefaultDtype() {
+  return Imperative::Get()->is_np_default_dtype() ?
+         mshadow::kFloat64 :
+         mshadow::kFloat32;
+}
+
+inline int GetDefaultDtype(int dtype) {
+  if (dtype != -1) return dtype;
+  return Imperative::Get()->is_np_default_dtype() ?
+         mshadow::kFloat64 :
+         mshadow::kFloat32;
+}
+
+struct MShadowTypeInfo {
+  std::string name;
+  int size;
+  int acc_size;
+
+  MShadowTypeInfo(const std::string name, const int size, const int acc_size) :
+    name(std::move(name)), size(size), acc_size(acc_size) {}
+
+  MShadowTypeInfo(const std::string name, const int size) :
+    MShadowTypeInfo(name, size, size) {}
+};
+
+MShadowTypeInfo mshadow_type_info(const int type_flag);
+
+inline bool AlignedMemAlloc(void** ptr, size_t size, size_t alignment) {
+#if _MSC_VER
+  *ptr = _aligned_malloc(size, alignment);
+  if (*ptr == nullptr)
+    return false;
+#else
+  int res = posix_memalign(ptr, alignment, size);
+  if (res != 0)
+    return false;
+#endif
+  return true;
+}
+
+inline void AlignedMemFree(void* ptr) {
+#if _MSC_VER
+  _aligned_free(ptr);
+#else
+  free(ptr);
+#endif
+}
+
+
+inline index_t div_round(const index_t a, const index_t b) {
+  return (a + b - 1) / b;
+}
+
+inline bool IsPower2(size_t N) {
+  return ((N & (N - 1)) == 0) && N != 0;
+}
+
+inline size_t RoundToPower2(size_t N) {
+  size_t ret = 1;
+  size_t copyN = N;
+  while (N >= 2) {
+    ret *= 2;
+    N /= 2;
+  }
+  if (ret < copyN) {
+    ret *= 2;
+  }
+  return ret;
 }
 
 }  // namespace common

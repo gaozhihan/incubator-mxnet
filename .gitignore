@@ -33,9 +33,12 @@ doc/html
 doc/latex
 doc/doc
 docs/web-data
+.jekyll-cache
+*.lock
 
 #dmlc
 config.mk
+config.cmake
 
 *.pyc
 .Rhistory
@@ -120,6 +123,10 @@ cmake_install.cmake
 # Mac OS X
 .DS_Store
 
+# Windows
+windows_package.7z
+windows_package
+
 #Notebook Automated Test
 !tests/nightly/test_tutorial_config.txt
 !tests/nightly/TestNotebook
@@ -162,3 +169,7 @@ coverage.xml
 
 # Local CMake build config
 cmake_options.yml
+
+# header file generated at compile time
+include/onednn/oneapi/dnnl/dnnl_version.h
+include/onednn/oneapi/dnnl/dnnl_config.h

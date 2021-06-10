@@ -49,12 +49,12 @@ void ResizeImplCUDA(Stream<gpu> *s,
 #endif  // MXNET_USE_CUDA
 
 struct ResizeParam : public dmlc::Parameter<ResizeParam> {
-  nnvm::Tuple<int> size;
+  mxnet::Tuple<int> size;
   bool keep_ratio;
   int interp;
   DMLC_DECLARE_PARAMETER(ResizeParam) {
     DMLC_DECLARE_FIELD(size)
-    .set_default(nnvm::Tuple<int>())
+    .set_default(mxnet::Tuple<int>())
     .describe("Size of new image. Could be (width, height) or (size)");
     DMLC_DECLARE_FIELD(keep_ratio)
     .describe("Whether to resize the short edge or both edges to `size`, "
@@ -68,10 +68,7 @@ struct ResizeParam : public dmlc::Parameter<ResizeParam> {
         "INTER_AREA - resampling using pixel area relation"
         "INTER_CUBIC - a bicubic interpolation over 4x4 pixel neighborhood"
         "INTER_LANCZOS4 - a Lanczos interpolation over 8x8 pixel neighborhood"
-        "Note that the GPU version only support bilinear interpolation(1)"
-        " and the result on cpu would be slightly different from gpu."
-        "It uses opencv resize function which tend to align center on cpu"
-        "while using contrib.bilinearResize2D which aligns corner on gpu");
+        "Note that the GPU version only support bilinear interpolation(1)");
   }
 };
 // handle the keep ratio param
@@ -112,15 +109,14 @@ inline SizeParam GetHeightAndWidth(int data_h,
   return SizeParam(resized_h, resized_w);
 }
 
-inline bool ResizeShape(const nnvm::NodeAttrs& attrs,
-                             mxnet::ShapeVector *in_attrs,
-                             mxnet::ShapeVector *out_attrs) {
+inline bool ResizeShapeImpl(const ResizeParam& param,
+                            mxnet::ShapeVector *in_attrs,
+                            mxnet::ShapeVector *out_attrs) {
   // input attrs should only be (h, w, c) or (n, h, w, c)
   CHECK((in_attrs->at(0).ndim() == 3U) || (in_attrs->at(0).ndim() == 4U))
     << "Input image dimension should be 3 or 4 but got "
     << in_attrs->at(0).ndim();
   const auto& ishape = (*in_attrs)[0];
-  const ResizeParam& param = nnvm::get<ResizeParam>(attrs.parsed);
   SizeParam size;
   if (ishape.ndim() == 3) {
     size = GetHeightAndWidth(ishape[H], ishape[W], param);
@@ -131,6 +127,13 @@ inline bool ResizeShape(const nnvm::NodeAttrs& attrs,
       mxnet::TShape({ishape[N], size.height, size.width, ishape[kC]}));
   }
   return true;
+}
+
+inline bool ResizeShape(const nnvm::NodeAttrs& attrs,
+                             mxnet::ShapeVector *in_attrs,
+                             mxnet::ShapeVector *out_attrs) {
+  const ResizeParam& param = nnvm::get<ResizeParam>(attrs.parsed);
+  return ResizeShapeImpl(param, in_attrs, out_attrs);
 }
 
 inline void ResizeImpl(const std::vector<TBlob> &inputs,
@@ -171,13 +174,10 @@ inline void ResizeImpl(const std::vector<TBlob> &inputs,
 }
 
 template <typename xpu>
-inline void Resize(const nnvm::NodeAttrs &attrs,
-                   const OpContext &ctx,
-                   const std::vector<TBlob> &inputs,
-                   const std::vector<OpReqType> &req,
-                   const std::vector<TBlob> &outputs) {
-  CHECK_EQ(outputs.size(), 1U);
-  const ResizeParam& param = nnvm::get<ResizeParam>(attrs.parsed);
+inline void ResizeImplWrapper(const ResizeParam& param,
+                              const OpContext &ctx,
+                              const std::vector<TBlob> &inputs,
+                              const std::vector<TBlob> &outputs) {
   SizeParam size;
   if (std::is_same<xpu, gpu>::value) {
 #if MXNET_USE_CUDA
@@ -209,6 +209,17 @@ inline void Resize(const nnvm::NodeAttrs &attrs,
         param.interp, i * input_step, i * output_step);
     }
   }
+}
+
+template <typename xpu>
+inline void Resize(const nnvm::NodeAttrs &attrs,
+                   const OpContext &ctx,
+                   const std::vector<TBlob> &inputs,
+                   const std::vector<OpReqType> &req,
+                   const std::vector<TBlob> &outputs) {
+  CHECK_EQ(outputs.size(), 1U);
+  const ResizeParam& param = nnvm::get<ResizeParam>(attrs.parsed);
+  ResizeImplWrapper<xpu>(param, ctx, inputs, outputs);
 }
 
 }  // namespace image

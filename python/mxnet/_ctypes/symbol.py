@@ -18,7 +18,6 @@
 # coding: utf-8
 # pylint: disable=invalid-name, protected-access, too-many-arguments,  global-statement
 """Symbolic configuration API."""
-from __future__ import absolute_import as _abs
 
 import ctypes
 from ..base import _LIB
@@ -26,11 +25,13 @@ from ..base import c_str_array, c_handle_array, c_str, mx_uint
 from ..base import SymbolHandle
 from ..base import check_call
 
+# The symbol class to be used (Cython or Ctypes)
 _symbol_cls = None
+_np_symbol_cls = None
 
 class SymbolBase(object):
     """Symbol is symbolic graph."""
-    __slots__ = ["handle"]
+    __slots__ = ["handle", "_alive"]
     # pylint: disable=no-member
     def __init__(self, handle):
         """Initialize the function with handle
@@ -41,9 +42,11 @@ class SymbolBase(object):
             the handle to the underlying C++ Symbol
         """
         self.handle = handle
+        self._alive = True
 
     def __del__(self):
         check_call(_LIB.NNSymbolFree(self.handle))
+        self._alive = False
 
     def _compose(self, *args, **kwargs):
         """Compose symbol on inputs.
@@ -115,7 +118,13 @@ def _set_symbol_class(cls):
     _symbol_cls = cls
 
 
-def _symbol_creator(handle, args, kwargs, keys, vals, name):
+def _set_np_symbol_class(cls):
+    """Set the numpy-compatible symbolic class to be cls"""
+    global _np_symbol_cls
+    _np_symbol_cls = cls
+
+
+def _symbol_creator(handle, args, kwargs, keys, vals, name, is_np_op, output_is_list=False):
     sym_handle = SymbolHandle()
     check_call(_LIB.MXSymbolCreateAtomicSymbol(
         ctypes.c_void_p(handle),
@@ -128,11 +137,18 @@ def _symbol_creator(handle, args, kwargs, keys, vals, name):
         raise TypeError(
             'Operators with variable length input can only accept input'
             'Symbols either as positional or keyword arguments, not both')
-    s = _symbol_cls(sym_handle)
+    create_symbol_fn = _np_symbol_cls if is_np_op else _symbol_cls
+    s = create_symbol_fn(sym_handle)
     if args:
         s._compose(*args, name=name)
     elif kwargs:
         s._compose(name=name, **kwargs)
     else:
         s._compose(name=name)
+    if is_np_op:
+        # Determine whether the symbol is a list.
+        if s.num_outputs > 1:
+            return list(s)
+        elif output_is_list:
+            return [s]
     return s

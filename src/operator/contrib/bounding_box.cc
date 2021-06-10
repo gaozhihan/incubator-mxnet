@@ -32,13 +32,16 @@ namespace op {
 DMLC_REGISTER_PARAMETER(BoxNMSParam);
 DMLC_REGISTER_PARAMETER(BoxOverlapParam);
 DMLC_REGISTER_PARAMETER(BipartiteMatchingParam);
+DMLC_REGISTER_PARAMETER(BoxDecodeParam);
+
 
 NNVM_REGISTER_OP(_contrib_box_nms)
 .add_alias("_contrib_box_non_maximum_suppression")
+.add_alias("_npx_box_nms")
 .describe(R"code(Apply non-maximum suppression to input.
 
-The output will be sorted in descending order according to `score`. Boxes with
-overlaps larger than `overlap_thresh`, smaller scores and background boxes
+The output will be sorted in descending order according to ``score``. Boxes with
+overlaps larger than ``overlap_thresh``, smaller scores and background boxes
 will be removed and filled with -1, the corresponding position will be recorded
 for backward propogation.
 
@@ -58,23 +61,23 @@ Input requirements::
 By default, a box is [id, score, xmin, ymin, xmax, ymax, ...],
 additional elements are allowed.
 
-- `id_index`: optional, use -1 to ignore, useful if `force_suppress=False`, which means
-  we will skip highly overlapped boxes if one is `apple` while the other is `car`.
+- ``id_index``: optional, use -1 to ignore, useful if ``force_suppress=False``, which means
+  we will skip highly overlapped boxes if one is ``apple`` while the other is ``car``.
 
-- `background_id`: optional, default=-1, class id for background boxes, useful
-  when `id_index >= 0` which means boxes with background id will be filtered before nms.
+- ``background_id``: optional, default=-1, class id for background boxes, useful
+  when ``id_index >= 0`` which means boxes with background id will be filtered before nms.
 
-- `coord_start`: required, default=2, the starting index of the 4 coordinates.
+- ``coord_start``: required, default=2, the starting index of the 4 coordinates.
   Two formats are supported:
 
-    - `corner`: [xmin, ymin, xmax, ymax]
+    - ``corner``: [xmin, ymin, xmax, ymax]
 
-    - `center`: [x, y, width, height]
+    - ``center``: [x, y, width, height]
 
-- `score_index`: required, default=1, box score/confidence.
-  When two boxes overlap IOU > `overlap_thresh`, the one with smaller score will be suppressed.
+- ``score_index``: required, default=1, box score/confidence.
+  When two boxes overlap IOU > ``overlap_thresh``, the one with smaller score will be suppressed.
 
-- `in_format` and `out_format`: default='corner', specify in/out box formats.
+- ``in_format`` and ``out_format``: default='corner', specify in/out box formats.
 
 Examples::
 
@@ -101,13 +104,14 @@ Examples::
   [](const NodeAttrs& attrs) {
     return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
   })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<FCompute>("FCompute<cpu>", BoxNMSForward<cpu>)
 .set_attr<nnvm::FGradient>("FGradient", ElemwiseGradUseOut{"_backward_contrib_box_nms"})
 .add_argument("data", "NDArray-or-Symbol", "The input")
 .add_arguments(BoxNMSParam::__FIELDS__());
 
 NNVM_REGISTER_OP(_backward_contrib_box_nms)
-.set_num_inputs(3)
+.set_num_inputs(4)
 .set_num_outputs(1)
 .set_attr_parser(ParamParser<BoxNMSParam>)
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
@@ -115,6 +119,7 @@ NNVM_REGISTER_OP(_backward_contrib_box_nms)
 .add_arguments(BoxNMSParam::__FIELDS__());
 
 NNVM_REGISTER_OP(_contrib_box_iou)
+.add_alias("_npx_box_iou")
 .describe(R"doc(Bounding box overlap of two arrays.
   The overlap is defined as Intersection-over-Union, aka, IOU.
   - lhs: (a_1, a_2, ..., a_n, 4) array
@@ -156,6 +161,7 @@ NNVM_REGISTER_OP(_backward_contrib_box_iou)
 .add_arguments(BoxOverlapParam::__FIELDS__());
 
 NNVM_REGISTER_OP(_contrib_bipartite_matching)
+.add_alias("_npx_bipartite_matching")
 .describe(R"doc(Compute bipartite matching.
   The matching is performed on score matrix with shape [B, N, M]
   - B: batch_size
@@ -185,6 +191,7 @@ NNVM_REGISTER_OP(_contrib_bipartite_matching)
   [](const NodeAttrs& attrs) {
     return std::vector<ResourceRequest>{ResourceRequest::kTempSpace};
   })
+.set_attr<THasDeterministicOutput>("THasDeterministicOutput", true)
 .set_attr<mxnet::FInferShape>("FInferShape", MatchingShape)
 .set_attr<nnvm::FInferType>("FInferType", ElemwiseType<1, 2>)
 .set_attr<FCompute>("FCompute<cpu>", BipartiteMatchingForward<cpu>)
@@ -200,6 +207,50 @@ NNVM_REGISTER_OP(_backward_contrib_bipartite_matching)
 .set_attr<nnvm::TIsBackward>("TIsBackward", true)
 .set_attr<FCompute>("FCompute<cpu>", BipartiteMatchingBackward<cpu>)
 .add_arguments(BipartiteMatchingParam::__FIELDS__());
+
+NNVM_REGISTER_OP(_contrib_box_encode)
+.add_alias("_npx_box_encode")
+.describe(R"doc(Encode bounding boxes training target with normalized center offsets.
+    Input bounding boxes are using corner type: `x_{min}, y_{min}, x_{max}, y_{max}`.) array
+)doc" ADD_FILELINE)
+.set_num_inputs(6)
+.set_num_outputs(2)
+.set_attr<nnvm::FListInputNames>("FListInputNames",
+  [](const NodeAttrs& attrs) {
+    return std::vector<std::string>{"samples", "matches", "anchors", "refs", "means", "stds"};
+  })
+.set_attr<mxnet::FInferShape>("FInferShape", BoxEncodeShape)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<6, 2>)
+.set_attr<FCompute>("FCompute<cpu>", BoxEncodeForward<cpu>)
+.set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
+.add_argument("samples", "NDArray-or-Symbol", "(B, N) value +1 (positive), -1 (negative), "
+              "0 (ignore)")
+.add_argument("matches", "NDArray-or-Symbol", "(B, N) value range [0, M)")
+.add_argument("anchors", "NDArray-or-Symbol", "(B, N, 4) encoded in corner")
+.add_argument("refs", "NDArray-or-Symbol", "(B, M, 4) encoded in corner")
+.add_argument("means", "NDArray-or-Symbol", "(4,) Mean value to be subtracted from encoded values")
+.add_argument("stds", "NDArray-or-Symbol", "(4,) Std value to be divided from encoded values");
+
+NNVM_REGISTER_OP(_contrib_box_decode)
+.add_alias("_npx_box_decode")
+.describe(R"doc(Decode bounding boxes training target with normalized center offsets.
+    Input bounding boxes are using corner type: ``x_{min}, y_{min}, x_{max}, y_{max}``
+    or center type: ``x, y, width, height``.) array
+)doc" ADD_FILELINE)
+.set_num_inputs(2)
+.set_num_outputs(1)
+.set_attr_parser(ParamParser<BoxDecodeParam>)
+.set_attr<nnvm::FListInputNames>("FListInputNames",
+  [](const NodeAttrs& attrs) {
+    return std::vector<std::string>{"data", "anchors"};
+  })
+.set_attr<mxnet::FInferShape>("FInferShape", BoxDecodeShape)
+.set_attr<nnvm::FInferType>("FInferType", ElemwiseType<2, 1>)
+.set_attr<FCompute>("FCompute<cpu>", BoxDecodeForward<cpu>)
+.set_attr<nnvm::FGradient>("FGradient", MakeZeroGradNodes)
+.add_argument("data", "NDArray-or-Symbol", "(B, N, 4) predicted bbox offset")
+.add_argument("anchors", "NDArray-or-Symbol", "(1, N, 4) encoded in corner or center")
+.add_arguments(BoxDecodeParam::__FIELDS__());
 
 }  // namespace op
 }  // namespace mxnet

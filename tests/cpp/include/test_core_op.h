@@ -79,7 +79,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
       keys.emplace_back(i_iter->first.c_str());
       values.emplace_back(i_iter->second.c_str());
     }
-    return imperative::ParseAttrs(op, op->num_inputs, count, &keys[0], &values[0]);
+    return imperative::ParseAttrs(op, op->num_inputs, count, keys.data(), values.data());
   }
 
   /*!
@@ -126,8 +126,8 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
     return array;
   }
 
-  nnvm::NodePtr MakeNode() const {
-    nnvm::NodePtr node = nnvm::Node::Create();
+  nnvm::ObjectPtr MakeNode() const {
+    nnvm::ObjectPtr node = nnvm::Node::Create();
     node->attrs = attrs_;
     return node;
   }
@@ -299,7 +299,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
     return foo::kFlag;
   }
 
-  nnvm::NodePtr GetBackwardDependency(const nnvm::NodePtr& node,
+  nnvm::ObjectPtr GetBackwardDependency(const nnvm::ObjectPtr& node,
                                       std::map<int, const NDArray *>* index2array) const {
     index2array->clear();
     static auto& fgradient = nnvm::Op::GetAttr<nnvm::FGradient>("FGradient");
@@ -310,7 +310,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
     node->inputs.clear();
     node->inputs.reserve(num_inputs);
     for (uint32_t i = 0; i < num_inputs; ++i) {
-      node->inputs.emplace_back(nnvm::NodeEntry{nullptr, i, 0});
+      node->inputs.emplace_back(nullptr, i, 0);
       (*index2array)[i] = &inputs()[i];
     }
 
@@ -319,7 +319,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
       ograd_entries.reserve(num_outputs);
       for (uint32_t i = 0; i < num_outputs; ++i) {
         const uint32_t index = num_inputs + i;
-        ograd_entries.emplace_back(nnvm::NodeEntry{nullptr, index, 1});
+        ograd_entries.emplace_back(nullptr, index, 1);
         (*index2array)[index] = &outputs()[i];
       }
       const std::vector<nnvm::NodeEntry> igrad_entries = fgradient[node->op()](node, ograd_entries);
@@ -331,8 +331,8 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
     return nullptr;
   }
 
-  nnvm::NodePtr CalcBackwardPass(std::map<int, const NDArray *> *index2array) const {
-    nnvm::NodePtr node = nnvm::Node::Create();
+  nnvm::ObjectPtr CalcBackwardPass(std::map<int, const NDArray *> *index2array) const {
+    nnvm::ObjectPtr node = nnvm::Node::Create();
     node->attrs = attrs_;
     return GetBackwardDependency(node, index2array);
   }
@@ -346,7 +346,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
             const std::vector<NDArray>& inputs = {},
             const std::vector<NDArray>& outputs = {},
             const CoreOpExecutor *backward_for_op = nullptr,
-            nnvm::NodePtr bwd_node_ptr = nullptr
+            nnvm::ObjectPtr bwd_node_ptr = nullptr
   ) {
     if (!initialized_) {
       initialized_ = true;
@@ -366,7 +366,7 @@ class CoreOpExecutor : public test::op::OperatorDataInitializer<DType>
       CHECK_NOTNULL(op_);
 
       std::map<int, const NDArray *> index2array;
-      nnvm::NodePtr bwd_node_ptr;
+      nnvm::ObjectPtr bwd_node_ptr;
       if (backward_for_op) {
         bwd_node_ptr = backward_for_op->CalcBackwardPass(&index2array);
       }
@@ -840,6 +840,7 @@ class CoreOpProp {
  public:
   virtual void Init(const kwargs_t& kwargs) { kwargs_ = kwargs; }
   const kwargs_t& GetArgs() const { return kwargs_; }
+  virtual ~CoreOpProp() {}
  private:
   kwargs_t          kwargs_;
 };

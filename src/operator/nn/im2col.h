@@ -152,7 +152,7 @@ inline void im2col_nd_core_cpu(const DType* data_input, const bool im2col,
     const mxnet::TShape& kernel_shape, const mxnet::TShape& pad, const mxnet::TShape& stride,
     const mxnet::TShape& dilation, DType* data_output, OpReqType req = mxnet::kWriteTo) {
   if (mxnet::kNullOp == req) return;
-  index_t num_spatial_axes = kernel_shape.ndim();
+  int num_spatial_axes = kernel_shape.ndim();
   if (!im2col) {
     index_t im_size = im_shape[1];  // skip batch dim
     for (index_t i = 0; i < num_spatial_axes; ++i) {
@@ -182,7 +182,7 @@ inline void im2col_nd_core_cpu(const DType* data_input, const bool im2col,
       // Loop over spatial axes in forward order to compute the indices in the
       // image and column, and whether the index lies in the padding.
       index_t index_col = c_col;
-      int index_im = c_col / kernel_size;
+      index_t index_im = c_col / kernel_size;
       bool is_padding = false;
       for (index_t d_i = 0; d_i < num_spatial_axes; ++d_i) {
         const index_t d = d_iter[d_i];
@@ -191,7 +191,7 @@ inline void im2col_nd_core_cpu(const DType* data_input, const bool im2col,
         is_padding |= d_im < 0 || d_im >= static_cast<int>(im_shape[d_i + 2]);
         index_col *= col_shape[d_i + 1];
         index_col += d;
-        index_im *= static_cast<int>(im_shape[d_i + 2]);
+        index_im *= static_cast<index_t>(im_shape[d_i + 2]);
         index_im += d_im;
       }
       if (im2col) {
@@ -319,7 +319,7 @@ inline void col2im(mshadow::Stream<cpu>* s,
                    const mxnet::TShape& col_shape, const mxnet::TShape& kernel_shape,
                    const mxnet::TShape& pad, const mxnet::TShape& stride,
                    const mxnet::TShape& dilation, DType* data_im, OpReqType req) {
-  index_t num_spatial_axes = kernel_shape.ndim();
+  int num_spatial_axes = kernel_shape.ndim();
   if (2 == num_spatial_axes) {
     col2im_cpu(data_col, im_shape[1], im_shape[2], im_shape[3],
                kernel_shape[0], kernel_shape[1], pad[0], pad[1],

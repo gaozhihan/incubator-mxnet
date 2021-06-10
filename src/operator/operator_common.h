@@ -39,7 +39,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
-#include "../common/cuda_utils.h"
+#include "../common/cuda/utils.h"
 #include "../common/utils.h"
 
 namespace mxnet {
@@ -103,9 +103,10 @@ struct InferStorageTypeError : public dmlc::Error {
     : dmlc::Error(msg_), msg(msg_), index(index) {}
 };
 
-/*! \brief check if shape is empty or contains unknown (0) dim. */
+/*! \brief check if shape is empty or contains unknown (0) dim.
+ * DEPRECATED. */
 inline bool shape_is_none(const mxnet::TShape& x) {
-  return x.ndim() == 0 || x.Size() == 0;
+  return !mxnet::shape_is_known(x);
 }
 
 /*! \brief check if type is none (-1) */
@@ -120,7 +121,7 @@ inline bool storage_type_is_none(const int& x) {
 
 /*! \brief check if shape is scalar({1}). */
 inline bool shape_is_scalar(const mxnet::TShape& x) {
-  return x.ndim() == 1 && x.Size() == 1;
+  return x.ndim() == 0;
 }
 
 /*! \brief get string representation of shape */
@@ -139,6 +140,8 @@ inline std::string type_string(const int& x) {
       return "float64";
     case mshadow::kFloat16:
       return "float16";
+    case mshadow::kBfloat16:
+      return "bfloat16";
     case mshadow::kInt8:
       return "int8";
     case mshadow::kUint8:
@@ -159,16 +162,16 @@ inline std::string type_string(const int& x) {
  * \return whether x and y are compatible.
  */
 inline bool shape_assign(mxnet::TShape *y, const mxnet::TShape& x) {
-  if (y->ndim() == 0) {
+  if (!mxnet::ndim_is_known(*y)) {
     *y = x;
     return true;
   } else if (y->ndim() != x.ndim()) {
-    return x.ndim() == 0;
+    return !mxnet::ndim_is_known(x);
   } else {
-    for (size_t i = 0; i < y->ndim(); ++i) {
-      if ((*y)[i] == 0) {
+    for (int i = 0; i < y->ndim(); ++i) {
+      if (!mxnet::dim_size_is_known(*y, i)) {
         (*y)[i] = x[i];
-      } else if ((*y)[i] != x[i] && x[i] != 0) {
+      } else if ((*y)[i] != x[i] && x[i] >= 0) {
         return false;
       }
     }
@@ -358,12 +361,36 @@ inline bool dispatch_fallback(StorageTypeVector* stypes, DispatchMode* dispatch)
   return true;
 }
 
+inline std::vector<nnvm::NodeEntry>CreateNodeEntries(
+  nnvm::ObjectPtr pNode,
+  const std::vector<nnvm::NodeEntry>* pOgrads = nullptr,
+  const std::vector<nnvm::NodeEntry>* pInputs = nullptr) {
+  if (pOgrads)
+    pNode->inputs.insert(pNode->inputs.end(), pOgrads->begin(), pOgrads->end());
+
+  if (pInputs)
+    pNode->inputs.insert(pNode->inputs.end(), pInputs->begin(), pInputs->end());
+
+  if (!pNode->is_variable()) {
+    CHECK_EQ(pNode->num_inputs(), pNode->inputs.size())
+      << "Number of inputs to operator " << pNode->op()->name << " (" << pNode->num_inputs()
+      << ") does not match the actual number of inputs provided to operator "
+      << pNode->attrs.name << " (" << pNode->inputs.size() << ").";
+  }
+
+  std::vector<nnvm::NodeEntry> ret;
+  for (uint32_t i = 0; i < pNode->num_outputs(); ++i)
+    ret.emplace_back(nnvm::NodeEntry{pNode, i, 0});
+
+  return ret;
+}
+
 // make a new node with operator op_name. Inputs are not filled.
-inline nnvm::NodePtr MakeNode(
+inline nnvm::ObjectPtr MakeNode(
     const char* op_name, const std::string& name,
-    std::vector<nnvm::NodeEntry> const * inputs,
-    std::unordered_map<std::string, std::string> const * dict,
-    nnvm::NodePtr const * fwd_node) {
+    std::vector<nnvm::NodeEntry> const * inputs = nullptr,
+    std::unordered_map<std::string, std::string> const * dict = nullptr,
+    nnvm::ObjectPtr const * fwd_node = nullptr) {
   auto p = nnvm::Node::Create();
   p->attrs.op = nnvm::Op::Get(op_name);
   p->attrs.name = name;
@@ -375,35 +402,38 @@ inline nnvm::NodePtr MakeNode(
   if (p->op()->attr_parser != nullptr) {
     p->op()->attr_parser(&(p->attrs));
   }
+  if (inputs != nullptr) {
+    CHECK_EQ(p->num_inputs(), p->inputs.size())
+      << "Number of inputs to operator " << op_name << " (" << p->num_inputs()
+      << ") does not match the actual number of inputs provided to operator "
+      << name << " (" << p->inputs.size() << ").";
+  }
   return p;
 }
 
-inline nnvm::NodePtr MakeNode(
+inline nnvm::ObjectPtr MakeNode(
     const char* op_name, const std::string& name,
     const std::vector<nnvm::NodeEntry>& inputs,
     std::unordered_map<std::string, std::string> const * dict,
-    nnvm::NodePtr const * fwd_node) {
+    nnvm::ObjectPtr const * fwd_node) {
   return MakeNode(op_name, name, &inputs, dict, fwd_node);
 }
 
 
 // quick helper to make node
 inline std::vector<nnvm::NodeEntry> MakeGradNode(
-    const char* op_name, const nnvm::NodePtr& n,
+    const char* op_name, const nnvm::ObjectPtr& n,
     const std::vector<nnvm::NodeEntry>& inputs,
     const std::unordered_map<std::string, std::string>& dict) {
   auto p = MakeNode(op_name, n->attrs.name + "_backward",
                     &inputs, &dict, &n);
-  std::vector<nnvm::NodeEntry> ret;
-  for (uint32_t i = 0; i < p->num_outputs(); ++i) {
-    ret.emplace_back(nnvm::NodeEntry{p, i, 0});
-  }
-  return ret;
+
+  return CreateNodeEntries(p);
 }
 
 // quick helper to make gradient nodes that simply pass back zero. could be used in output ops.
 inline std::vector<nnvm::NodeEntry> MakeZeroGradNodes(
-    const nnvm::NodePtr& n,
+    const nnvm::ObjectPtr& n,
     const std::vector<nnvm::NodeEntry>& ograds) {
   std::vector<nnvm::NodeEntry> ret;
   for (uint32_t i = 0; i < n->num_inputs(); ++i) {
@@ -413,8 +443,7 @@ inline std::vector<nnvm::NodeEntry> MakeZeroGradNodes(
     } else {
       os << n->attrs.name << "_in" << i << "_backward";
     }
-    auto p = MakeNode("zeros_like", os.str(), {n->inputs[i]}, nullptr, &n);
-    ret.emplace_back(nnvm::NodeEntry{p, 0, 0});
+    ret.emplace_back(MakeNode("zeros_like", os.str(), {n->inputs[i]}, nullptr, &n));
   }
   return ret;
 }
@@ -424,10 +453,13 @@ inline std::vector<nnvm::NodeEntry> MakeZeroGradNodes(
 inline bool CheckGradAllZero(const std::vector<nnvm::NodeEntry>& ograds) {
   static const auto zero_op = nnvm::Op::Get("_zeros");
   static const auto zero_like_op = nnvm::Op::Get("zeros_like");
-  if (!ograds.size()) return false;
+  if (ograds.empty())
+    return false;
   for (const auto& grad : ograds) {
-    if (!grad.node) return false;
-    if (grad.node->op() != zero_op && grad.node->op() != zero_like_op ) return false;
+    if (!grad.node)
+      return false;
+    if (grad.node->op() != zero_op && grad.node->op() != zero_like_op )
+      return false;
   }
   return true;
 }
@@ -435,20 +467,16 @@ inline bool CheckGradAllZero(const std::vector<nnvm::NodeEntry>& ograds) {
 // make gradient node that doesn't add to objective.
 // i.e. igrads are always zero when ograds are zero.
 inline std::vector<nnvm::NodeEntry> MakeNonlossGradNode(
-    const char* op_name, const nnvm::NodePtr& n,
+    const char* op_name, const nnvm::ObjectPtr& n,
     const std::vector<nnvm::NodeEntry>& ograds,
     const std::vector<nnvm::NodeEntry>& inputs,
     const std::unordered_map<std::string, std::string>& dict) {
-  if (CheckGradAllZero(ograds)) return MakeZeroGradNodes(n, ograds);
+  if (CheckGradAllZero(ograds))
+    return MakeZeroGradNodes(n, ograds);
   auto p = MakeNode(op_name, n->attrs.name + "_backward",
                     nullptr, &dict, &n);
-  p->inputs.insert(p->inputs.end(), ograds.begin(), ograds.end());
-  p->inputs.insert(p->inputs.end(), inputs.begin(), inputs.end());
-  std::vector<nnvm::NodeEntry> ret;
-  for (uint32_t i = 0; i < p->num_outputs(); ++i) {
-    ret.emplace_back(nnvm::NodeEntry{p, i, 0});
-  }
-  return ret;
+
+  return CreateNodeEntries(p, &ograds, &inputs);
 }
 
 /*! \brief Parse keyword arguments as PType arguments and save to parsed */
@@ -522,16 +550,63 @@ class OpSignature {
    * and the layout to sign the op.
    */
 
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
   void AddSign(const mkldnn::memory &mem) {
-    auto desc = mem.get_primitive_desc().desc();
-    hash = hash * 2 + desc.data.format;
-    eles.push_back(desc.data.format);
+    auto desc = mem.get_desc();
+    hash = hash * 2 + desc.data.format_kind;
+    eles.push_back(desc.data.format_kind);
     hash = hash * 2 + desc.data.data_type;
     eles.push_back(desc.data.data_type);
     for (int i = 0; i < desc.data.ndims; i++) {
       hash = hash * 2 + desc.data.dims[i];
       eles.push_back(desc.data.dims[i]);
+    }
+    switch (desc.data.format_kind) {
+      case mkldnn_blocked:
+        hash = hash * 2 + desc.data.ndims;
+        eles.push_back(desc.data.ndims);
+        for (int i = 0; i < desc.data.ndims; i++) {
+          hash = hash * 2 + desc.data.format_desc.blocking.strides[i];
+          eles.push_back(desc.data.format_desc.blocking.strides[i]);
+        }
+        hash = hash * 2 + desc.data.format_desc.blocking.inner_nblks;
+        eles.push_back(desc.data.format_desc.blocking.inner_nblks);
+        for (int i = 0; i < desc.data.format_desc.blocking.inner_nblks; i++) {
+          hash = hash * 2 + desc.data.format_desc.blocking.inner_blks[i];
+          hash = hash * 2 + desc.data.format_desc.blocking.inner_idxs[i];
+          eles.push_back(desc.data.format_desc.blocking.inner_blks[i]);
+          eles.push_back(desc.data.format_desc.blocking.inner_idxs[i]);
+        }
+        break;
+      case mkldnn_format_kind_wino:
+        hash = hash * 2 + desc.data.format_desc.wino_desc.wino_format;
+        eles.push_back(desc.data.format_desc.wino_desc.wino_format);
+        break;
+      case mkldnn_format_kind_rnn_packed:
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.format;
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.format);
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.n_parts;
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.n_parts);
+        for (int i = 0; i < desc.data.format_desc.rnn_packed_desc.n_parts; ++i) {
+          hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.parts[i];
+          hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.part_pack_size[i];
+          hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.pack_part[i];
+          eles.push_back(desc.data.format_desc.rnn_packed_desc.parts[i]);
+          eles.push_back(desc.data.format_desc.rnn_packed_desc.part_pack_size[i]);
+          eles.push_back(desc.data.format_desc.rnn_packed_desc.pack_part[i]);
+        }
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.n;
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.ldb;
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.offset_compensation;
+        hash = hash * 2 + desc.data.format_desc.rnn_packed_desc.size;
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.n);
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.ldb);
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.offset_compensation);
+        eles.push_back(desc.data.format_desc.rnn_packed_desc.size);
+        break;
+      default:
+      // nothing need to add
+        break;
     }
   }
 #endif
@@ -543,7 +618,7 @@ class OpSignature {
   }
 
   void AddSign(const NDArray &arr) {
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
     if (arr.IsMKLDNNData()) {
       AddSign(*(arr.GetMKLDNNData()));
     } else {
@@ -551,7 +626,7 @@ class OpSignature {
       hash = hash * 2 + arr.dtype();
       eles.push_back(arr.dtype());
       AddSign(arr.shape());
-#if MXNET_USE_MKLDNN == 1
+#if MXNET_USE_ONEDNN == 1
     }
 #endif
   }
@@ -563,7 +638,7 @@ class OpSignature {
   }
 
   void AddSign(const mxnet::TShape &shape) {
-    for (size_t i = 0; i < shape.ndim(); i++) {
+    for (int i = 0; i < shape.ndim(); i++) {
       hash = hash * 2 + shape[i];
       eles.push_back(shape[i]);
     }
@@ -571,6 +646,11 @@ class OpSignature {
 
   void AddSign(int val) {
     hash = hash * 2 + val;
+    eles.push_back(val);
+  }
+
+  void AddSign(float val) {
+    hash = dmlc::HashCombine(hash, val);
     eles.push_back(val);
   }
 

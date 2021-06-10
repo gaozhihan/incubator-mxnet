@@ -39,15 +39,15 @@ namespace op {
 
 struct Sum {
   template<typename DType>
-  MSHADOW_XINLINE static DType sum(int i, const DType* a) {
+  MSHADOW_XINLINE static DType sum(index_t i, const DType* a) {
     return a[i];
   }
   template<typename DType, typename... DTypes>
-  MSHADOW_XINLINE static DType sum(int i, const DType* a, const DTypes... b) {
+  MSHADOW_XINLINE static DType sum(index_t i, const DType* a, const DTypes... b) {
     return a[i] + sum(i, b...);
   }
   template<typename DType, typename... DTypes>
-  MSHADOW_XINLINE static void Map(int i, DType* out, const OpReqType req, const DType* in0,
+  MSHADOW_XINLINE static void Map(index_t i, DType* out, const OpReqType req, const DType* in0,
     const DTypes... ins) {
     KERNEL_ASSIGN(out[i], req, sum(i, in0, ins...));
   }
@@ -64,7 +64,7 @@ void ElementWiseSumCompute_(const nnvm::NodeAttrs& attrs,
   size_t size = in_data.size();
   Stream<xpu> *s = ctx.get_stream<xpu>();
   DType* out_dptr = out_data[0].dptr<DType>();
-  int out_size = static_cast<int>((out_data[0].Size() + DataType<DType>::kLanes - 1)
+  index_t out_size = static_cast<index_t>((out_data[0].Size() + DataType<DType>::kLanes - 1)
                                   /DataType<DType>::kLanes);
   switch (size) {
     case 2: {
@@ -94,7 +94,7 @@ void ElementWiseSumCompute_(const nnvm::NodeAttrs& attrs,
       Kernel<Sum, xpu>::Launch(s, out_size, out_dptr, req[0], in_0_dptr);
       for (size_t i = 1; i < size; ++i) {
         DType* in_dptr = in_data[i].dptr<DType>();
-        Kernel<Sum, xpu>::Launch(s, out_size, out_dptr, req[0], out_dptr, in_dptr);
+        Kernel<Sum, xpu>::Launch(s, out_size, out_dptr, kWriteTo, out_dptr, in_dptr);
       }
       break;
     }
@@ -109,18 +109,6 @@ void ElementWiseSumCompute(const nnvm::NodeAttrs& attrs,
                            const std::vector<TBlob>& outputs) {
   CHECK_EQ(outputs.size(), 1U);
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
-      ElementWiseSumCompute_<xpu, DType>(attrs, ctx, inputs, req, outputs);
-  });
-}
-
-template<typename xpu>
-void ElementWiseSumComputeWithHalf2(const nnvm::NodeAttrs& attrs,
-                                    const OpContext& ctx,
-                                    const std::vector<TBlob>& inputs,
-                                    const std::vector<OpReqType>& req,
-                                    const std::vector<TBlob>& outputs) {
-  CHECK_EQ(outputs.size(), 1U);
-  MSHADOW_TYPE_SWITCH_WITH_HALF2(outputs[0].type_flag_, DType, {
       ElementWiseSumCompute_<xpu, DType>(attrs, ctx, inputs, req, outputs);
   });
 }

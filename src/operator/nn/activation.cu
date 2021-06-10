@@ -56,12 +56,15 @@ void ActivationCompute<gpu>(const nnvm::NodeAttrs& attrs,
   const ActivationParam& param = nnvm::get<ActivationParam>(attrs.parsed);
   const int act_type = param.act_type;
 
-  // SoftReLU and kSoftSign are both not supported by CUDNN yet
+  // SoftReLU, kSoftSign and Mish are not supported by CUDNN yet
   if (act_type == activation::kSoftReLU) {
     ActivationForward<gpu, mshadow_op::softrelu, mshadow_op::softrelu_grad>(ctx,
       inputs[0], req[0], outputs[0]);
   } else if (act_type == activation::kSoftSign) {
     ActivationForward<gpu, mshadow_op::softsign, mshadow_op::softsign_grad>(ctx,
+      inputs[0], req[0], outputs[0]);
+  } else if (act_type == activation::kMish) {
+    ActivationForward<gpu, mshadow_op::mish, mshadow_op::mish_grad>(ctx,
       inputs[0], req[0], outputs[0]);
   } else {
     MSHADOW_REAL_TYPE_SWITCH(inputs[0].type_flag_, DType, {
@@ -82,24 +85,54 @@ void ActivationGradCompute<gpu>(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(outputs.size(), 1U);
   CHECK_EQ(req.size(), 1U);
 
-  // both SoftReLU and SoftSign not supported by CUDNN yet
+  bool do_memory_opt = dmlc::GetEnv("MXNET_MEMORY_OPT", 0);
+
+  // SoftReLU, SoftSign and Mish not supported by CUDNN yet
   if (act_type == activation::kSoftReLU) {
     ActivationBackward<gpu, mshadow_op::softrelu, mshadow_op::softrelu_grad>(
       ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
-  } else if (act_type == activation::kSoftSign) {
-    ActivationBackward<gpu, mshadow_op::softsign, mshadow_op::softsign_grad>(
+  } else if (act_type == activation::kMish) {
+    ActivationBackward<gpu, mshadow_op::mish, mshadow_op::mish_grad>(
       ctx, inputs.at(0), inputs.at(2), req[0], outputs[0]);
+  } else if (act_type == activation::kSoftSign) {
+    if (do_memory_opt) {
+      ActivationBackward<gpu, mshadow_op::softsign, mshadow_op::softsign_grad>(
+        ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
+    } else {
+      ActivationBackward<gpu, mshadow_op::softsign, mshadow_op::softsign_grad>(
+        ctx, inputs.at(0), inputs.at(2), req[0], outputs[0]);
+    }
   } else if (act_type == activation::kReLU) {
-    MSHADOW_REAL_TYPE_SWITCH(inputs.at(0).type_flag_, DType, {
-      // XXX: for y = relu(x), y is passed as "in_data" to Backward()
-      get_cudnn_op<DType>(param).Backward(ctx, inputs.at(0), inputs.at(1),
-                                          inputs.at(1), req[0], outputs[0]);
-    });
+    if (do_memory_opt) {
+      ActivationBackward<gpu, mshadow_op::relu, mshadow_op::relu_grad>(
+        ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
+    } else {
+      MSHADOW_REAL_TYPE_SWITCH(inputs.at(0).type_flag_, DType, {
+        // XXX: for y = relu(x), y is passed as "in_data" to Backward()
+        get_cudnn_op<DType>(param).Backward(ctx, inputs.at(0), inputs.at(1),
+                                            inputs.at(1), req[0], outputs[0]);
+      });
+    }
   } else {
-    MSHADOW_REAL_TYPE_SWITCH(inputs.at(0).type_flag_, DType, {
-      get_cudnn_op<DType>(param).Backward(ctx, inputs.at(0), inputs.at(2),
-                                          inputs.at(1), req[0], outputs[0]);
-    });
+    if (do_memory_opt) {
+      if (act_type == activation::kTanh) {
+        ActivationBackward<gpu, mshadow_op::tanh, mshadow_op::tanh_grad>(
+          ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
+      } else if (act_type == activation::kSigmoid) {
+        ActivationBackward<gpu, mshadow_op::sigmoid, mshadow_op::sigmoid_grad>(
+          ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
+      } else if (act_type == activation::kLogSigmoid) {
+        ActivationBackward<gpu, mshadow_op::log_sigmoid, mshadow_op::log_sigmoid_grad>(
+          ctx, inputs.at(0), inputs.at(1), req[0], outputs[0]);
+      } else {
+        LOG(FATAL) << "unknown activation type";
+      }
+    } else {
+      MSHADOW_REAL_TYPE_SWITCH(inputs.at(0).type_flag_, DType, {
+        get_cudnn_op<DType>(param).Backward(ctx, inputs.at(0), inputs.at(2),
+                                            inputs.at(1), req[0], outputs[0]);
+      });
+    }  // if (do_memory_opt)
   }
 }
 #endif

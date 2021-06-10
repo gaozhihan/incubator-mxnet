@@ -19,8 +19,6 @@
 # pylint: disable=consider-iterating-dictionary
 
 """Text token indexer."""
-from __future__ import absolute_import
-from __future__ import print_function
 
 import collections
 
@@ -212,7 +210,6 @@ class Vocabulary(object):
         for idx in indices:
             if not isinstance(idx, int) or idx > max_idx:
                 raise ValueError('Token index %d in the provided `indices` is invalid.' % idx)
-            else:
-                tokens.append(self.idx_to_token[idx])
+            tokens.append(self.idx_to_token[idx])
 
         return tokens[0] if to_reduce else tokens

@@ -93,7 +93,7 @@ inline bool ToTensorShape(const nnvm::NodeAttrs& attrs,
   CHECK_EQ(out_attrs->size(), 1U);
 
   mxnet::TShape &shp = (*in_attrs)[0];
-  if (!shp.ndim()) return false;
+  if (!shape_is_known(shp)) return false;
 
   CHECK((shp.ndim() == 3) || (shp.ndim() == 4))
       << "Input image must have shape (height, width, channels), or "
@@ -215,16 +215,16 @@ void ToTensorOpForward(const nnvm::NodeAttrs &attrs,
 }
 
 struct NormalizeParam : public dmlc::Parameter<NormalizeParam> {
-  nnvm::Tuple<float> mean;
-  nnvm::Tuple<float> std;
+  mxnet::Tuple<float> mean;
+  mxnet::Tuple<float> std;
 
   DMLC_DECLARE_PARAMETER(NormalizeParam) {
     DMLC_DECLARE_FIELD(mean)
-    .set_default(nnvm::Tuple<float> {0.0f, 0.0f, 0.0f, 0.0f})
+    .set_default(mxnet::Tuple<float> {0.0f, 0.0f, 0.0f, 0.0f})
     .describe("Sequence of means for each channel. "
               "Default value is 0.");
     DMLC_DECLARE_FIELD(std)
-    .set_default(nnvm::Tuple<float> {1.0f, 1.0f, 1.0f, 1.0f})
+    .set_default(mxnet::Tuple<float> {1.0f, 1.0f, 1.0f, 1.0f})
     .describe("Sequence of standard deviations for each channel. "
               "Default value is 1.");
   }
@@ -245,7 +245,7 @@ inline bool NormalizeOpShape(const nnvm::NodeAttrs& attrs,
       << "Input tensor must have shape (channels, height, width), or "
       << "(N, channels, height, width), but got " << dshape;
 
-  uint32_t nchannels;
+  int nchannels = 0;
   if (dshape.ndim() == 3) {
     nchannels = dshape[0];
     CHECK(nchannels == 3 || nchannels == 1)
@@ -339,7 +339,7 @@ void NormalizeOpForward(const nnvm::NodeAttrs &attrs,
   std::vector<float> mean(3);
   std::vector<float> std(3);
   if (param.mean.ndim() == 1) {
-    mean[0] = mean[1] = mean[3] = param.mean[0];
+    mean[0] = mean[1] = mean[2] = param.mean[0];
   } else {
     mean[0] = param.mean[0];
     mean[1] = param.mean[1];
@@ -549,10 +549,12 @@ template<typename DType, int axis>
 void FlipImpl(const mxnet::TShape &shape, DType *src, DType *dst) {
   int head = 1, mid = shape[axis], tail = 1;
   for (int i = 0; i < axis; ++i) head *= shape[i];
-  for (uint32_t i = axis+1; i < shape.ndim(); ++i) tail *= shape[i];
+  for (int i = axis+1; i < shape.ndim(); ++i) tail *= shape[i];
 
   for (int i = 0; i < head; ++i) {
-    for (int j = 0; j < (mid >> 1); ++j) {
+    // if inplace flip, skip the mid point in axis, otherwise copy is required
+    int mid2 = (src == dst) ? mid >> 1 : (mid + 1) >> 1;
+    for (int j = 0; j < mid2; ++j) {
       int idx1 = (i*mid + j) * tail;
       int idx2 = idx1 + (mid-(j << 1)-1) * tail;
       for (int k = 0; k < tail; ++k, ++idx1, ++idx2) {
@@ -588,6 +590,16 @@ inline void FlipTopBottom(const nnvm::NodeAttrs &attrs,
   });
 }
 
+struct RandomFlipParam : public dmlc::Parameter<RandomFlipParam> {
+  float p;
+
+  DMLC_DECLARE_PARAMETER(RandomFlipParam) {
+    DMLC_DECLARE_FIELD(p)
+    .set_default(0.5f)
+    .describe("The probablity of flipping the image.");
+  }
+};
+
 inline void RandomFlipLeftRight(
     const nnvm::NodeAttrs &attrs,
     const OpContext &ctx,
@@ -595,10 +607,12 @@ inline void RandomFlipLeftRight(
     const std::vector<OpReqType> &req,
     const std::vector<TBlob> &outputs) {
   using namespace mshadow;
+  const RandomFlipParam &param = nnvm::get<RandomFlipParam>(attrs.parsed);
   Stream<cpu> *s = ctx.get_stream<cpu>();
   Random<cpu> *prnd = ctx.requested[0].get_random<cpu, float>(s);
+  std::normal_distribution<float> dist(0, 1);
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
-    if (std::bernoulli_distribution()(prnd->GetRndEngine())) {
+    if (dist(prnd->GetRndEngine()) > param.p) {
       if (outputs[0].dptr_ != inputs[0].dptr_) {
         std::memcpy(outputs[0].dptr_, inputs[0].dptr_, inputs[0].Size() * sizeof(DType));
       }
@@ -616,10 +630,12 @@ inline void RandomFlipTopBottom(
     const std::vector<OpReqType> &req,
     const std::vector<TBlob> &outputs) {
   using namespace mshadow;
+  const RandomFlipParam &param = nnvm::get<RandomFlipParam>(attrs.parsed);
   Stream<cpu> *s = ctx.get_stream<cpu>();
   Random<cpu> *prnd = ctx.requested[0].get_random<cpu, float>(s);
+  std::normal_distribution<float> dist(0, 1);
   MSHADOW_TYPE_SWITCH(outputs[0].type_flag_, DType, {
-    if (std::bernoulli_distribution()(prnd->GetRndEngine())) {
+    if (dist(prnd->GetRndEngine()) > param.p) {
       if (outputs[0].dptr_ != inputs[0].dptr_) {
         std::memcpy(outputs[0].dptr_, inputs[0].dptr_, inputs[0].Size() * sizeof(DType));
       }
@@ -844,7 +860,8 @@ inline void HLS2RGBConvert(const float& src_h,
 
     if (h < 0) {
       do { h += 6; } while (h < 0);
-    } else if (h >= 6) {
+    }
+    if (h >= 6) {  // h + 6 >= 6 holds true for some h < 0
       do { h -= 6; } while (h >= 6);
     }
 
@@ -981,7 +998,7 @@ inline void RandomColorJitter(const nnvm::NodeAttrs &attrs,
 }
 
 struct AdjustLightingParam : public dmlc::Parameter<AdjustLightingParam> {
-  nnvm::Tuple<float> alpha;
+  mxnet::Tuple<float> alpha;
   DMLC_DECLARE_PARAMETER(AdjustLightingParam) {
     DMLC_DECLARE_FIELD(alpha)
     .describe("The lighting alphas for the R, G, B channels.");
@@ -997,7 +1014,7 @@ struct RandomLightingParam : public dmlc::Parameter<RandomLightingParam> {
   }
 };
 
-inline void AdjustLightingImpl(const nnvm::Tuple<float>& alpha,
+inline void AdjustLightingImpl(const mxnet::Tuple<float>& alpha,
                         const OpContext &ctx,
                         const std::vector<TBlob> &inputs,
                         const std::vector<OpReqType> &req,

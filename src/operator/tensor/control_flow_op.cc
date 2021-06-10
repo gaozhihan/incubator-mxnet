@@ -70,12 +70,12 @@ Examples::
   // Use the following lambda function instead of ElemwiseGradUseIn
   // for best efficiency. grad[condition] = 0; to calculate grad[x] and grad[y]
   // we need only condition from input.
-  [](const nnvm::NodePtr& n, const std::vector<nnvm::NodeEntry>& ograds) {
+  [](const nnvm::ObjectPtr& n, const std::vector<nnvm::NodeEntry>& ograds) {
     std::vector<nnvm::NodeEntry> ret;
     // make zero grad node for grad[condition]
     auto p = MakeNode("zeros_like", n->attrs.name + "_cond_backward",
                       {n->inputs[0]}, nullptr, &n);
-    ret.emplace_back(nnvm::NodeEntry{p, 0, 0});
+    ret.emplace_back(p);
 
     // make grad nodes for grad[x] and grad[y]
     std::vector<nnvm::NodeEntry> heads(ograds.begin(), ograds.end());
@@ -89,9 +89,8 @@ Examples::
     }
     p->control_deps.emplace_back(n);
     p->inputs = std::move(heads);
-    ret.emplace_back(nnvm::NodeEntry{p, 0, 0});
-    ret.emplace_back(nnvm::NodeEntry{p, 1, 0});
-
+    ret.emplace_back(p, 0, 0);
+    ret.emplace_back(p, 1, 0);
     return ret;
   })
 .add_argument("condition", "NDArray-or-Symbol", "condition array")

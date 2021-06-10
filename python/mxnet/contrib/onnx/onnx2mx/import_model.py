@@ -24,7 +24,7 @@ from .import_onnx import GraphProto
 def import_model(model_file):
     """Imports the ONNX model file, passed as a parameter, into MXNet symbol and parameters.
     Operator support and coverage -
-    https://cwiki.apache.org/confluence/display/MXNET/MXNet-ONNX+Integration
+    https://cwiki.apache.org/confluence/display/MXNET/ONNX+Operator+Coverage
 
     Parameters
     ----------
@@ -56,7 +56,8 @@ def import_model(model_file):
                           + "Instructions to install - https://github.com/onnx/onnx")
     # loads model file and returns ONNX protobuf object
     model_proto = onnx.load_model(model_file)
-    sym, arg_params, aux_params = graph.from_onnx(model_proto.graph)
+    model_opset_version = max([x.version for x in model_proto.opset_import])
+    sym, arg_params, aux_params = graph.from_onnx(model_proto.graph, opset_version=model_opset_version)
     return sym, arg_params, aux_params
 
 def get_model_metadata(model_file):
